@@ -2,11 +2,11 @@ import os
 import json
 import glob
 import re
+import math
 import hashlib
 import pickle
 import sqlite3
 from collections import defaultdict, OrderedDict
-
 
 import numpy as np
 from PIL import Image
@@ -42,10 +42,6 @@ def scan_available_frames(seq_dir: str, seq_name: str) -> list:
     return sorted(out)
 
 def get_sequence_infos(split_keyword: str, labels_base: str, frames_base: str) -> list:
-    """
-    Scans labels_base and frames_base for subdirectories containing split_keyword.
-    Returns a list of (json_path, seq_dir, seq_name).
-    """
     infos = []
     if not os.path.isdir(labels_base) or not os.path.isdir(frames_base):
         return infos
@@ -66,8 +62,11 @@ def get_sequence_infos(split_keyword: str, labels_base: str, frames_base: str) -
 
 # ── 2. DATASET & CACHING ──────────────────────────────────────────────────────
 
+_DB_SCHEMA_VERSION = "v2"   
+
 def _dataset_cache_fingerprint(sequence_infos: list) -> str:
     h = hashlib.md5()
+    h.update(_DB_SCHEMA_VERSION.encode())   
     for json_path, seq_dir, seq_name in sorted(sequence_infos):
         if os.path.exists(json_path):
             mtime = str(os.path.getmtime(json_path))
@@ -79,32 +78,41 @@ def _dataset_cache_fingerprint(sequence_infos: list) -> str:
 class EnergySegDataset(Dataset):
     CACHE_DIR = ".dataset_cache"
 
-    def __init__(self, sequence_infos: list, frames_base: str, mic_base: str, 
-                 acoustic_extractor, frames_per_epoch: int = None,
-                 img_w: int = 360, img_h: int = 180, dist_norm: float = 500.0,
-                 cache_max_size: int = 200):
-        self.frames_base = frames_base
-        self.mic_base = mic_base
+    def __init__(
+        self,
+        sequence_infos: list,
+        frames_base: str,
+        mic_base: str,
+        acoustic_extractor,
+        frames_per_epoch: int = None,
+        img_w: int = 360,
+        img_h: int = 180,
+        dist_norm: float = 500.0,
+        cache_max_size: int = 200,
+        augmentor=None,
+    ):
+        self.frames_base        = frames_base
+        self.mic_base           = mic_base
         self.acoustic_extractor = acoustic_extractor
-        self.frames_per_epoch = frames_per_epoch
-        self.img_w = img_w
-        self.img_h = img_h
-        self.dist_norm = dist_norm
-        self.cache_max_size = cache_max_size
-        
-        self.frame_cache = OrderedDict()
-        
-        # RAM Optimization: We only store integers in memory now.
-        self.seq_map = {}        # int -> (seq_dir, seq_name)
-        self.all_samples = []    # list of (seq_id, frame_idx)
-        self.current_indices = []
-        
-        # Worker DB connection (initialized lazily to survive multiprocessing forks)
-        self.db_conn = None
+        self.frames_per_epoch   = frames_per_epoch
+        self.img_w              = img_w
+        self.img_h              = img_h
+        self.dist_norm          = dist_norm
+        self.cache_max_size     = cache_max_size
+        self.augmentor          = augmentor
+
+        self.frame_cache    = OrderedDict()
+
+        self.seq_map        = {}
+        self.all_samples    = []
+        self.current_indices= []
+        self.class_to_sample_indices: dict = defaultdict(list)
+
+        self.db_conn        = None
 
         os.makedirs(self.CACHE_DIR, exist_ok=True)
-        fingerprint = _dataset_cache_fingerprint(sequence_infos)
-        self.db_path = os.path.join(self.CACHE_DIR, f"annotations_{fingerprint}.db")
+        fingerprint   = _dataset_cache_fingerprint(sequence_infos)
+        self.db_path  = os.path.join(self.CACHE_DIR, f"annotations_{fingerprint}.db")
 
         if os.path.exists(self.db_path):
             print(f"[Dataset] Cache hit  — loading index from {self.db_path}")
@@ -121,25 +129,26 @@ class EnergySegDataset(Dataset):
         self.reset_epoch()
 
     def _get_db_conn(self):
-        # Lazy connection: crucial for PyTorch workers so they don't share file descriptors
         if self.db_conn is None:
-            self.db_conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+            import pathlib
+            db_uri       = pathlib.Path(self.db_path).absolute().as_uri()
+            self.db_conn = sqlite3.connect(f"{db_uri}?mode=ro", uri=True)
         return self.db_conn
 
     def _build_db(self, sequence_infos: list):
-        from tqdm import tqdm # Importing here just in case, though it's likely at the top of your file
-        
-        # Create a disk-backed database for annotations
+        from tqdm import tqdm
+
         conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
+        c    = conn.cursor()
         c.execute("CREATE TABLE IF NOT EXISTS annots (seq_id INTEGER, frame_idx INTEGER, data BLOB)")
         c.execute("CREATE TABLE IF NOT EXISTS seqs (seq_id INTEGER, seq_dir TEXT, seq_name TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS frame_classes (sample_idx INTEGER, category_id INTEGER)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_lookup ON annots (seq_id, frame_idx)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_fc ON frame_classes (category_id)")
 
-        seq_id = 0
+        seq_id              = 0
         n_pos, n_neg, n_ann = 0, 0, 0
-        
-        # Wrapped the sequence_infos loop in a tqdm progress bar
+
         for json_path, seq_dir, seq_name in tqdm(sequence_infos, desc="[Dataset] Building SQLite DB", leave=False):
             c.execute("INSERT INTO seqs VALUES (?, ?, ?)", (seq_id, seq_dir, seq_name))
             self.seq_map[seq_id] = (seq_dir, seq_name)
@@ -156,52 +165,61 @@ class EnergySegDataset(Dataset):
             all_ids       = sorted(annotated_ids | disk_ids)
 
             for fi in all_ids:
-                anns = by_frame.get(fi, [])
+                anns       = by_frame.get(fi, [])
+                sample_idx = len(self.all_samples)
                 self.all_samples.append((seq_id, fi))
-                
-                # Serialize the nested dict to binary and push to disk
                 c.execute("INSERT INTO annots VALUES (?, ?, ?)", (seq_id, fi, pickle.dumps(anns)))
-                
+
+                for ann in anns:
+                    cat_id = int(ann["category_id"])
+                    c.execute("INSERT INTO frame_classes VALUES (?, ?)", (sample_idx, cat_id))
+                    self.class_to_sample_indices[cat_id].append(sample_idx)
+
                 if anns:
                     n_pos += 1
                     n_ann += len(anns)
                 else:
                     n_neg += 1
-                    
+
             seq_id += 1
 
         conn.commit()
         conn.close()
-        print(f"[Dataset] SQLite DB built. Scanned {len(sequence_infos)} sequences | "
-              f"{len(self.all_samples)} frames total ({n_pos} pos / {n_neg} neg) | {n_ann} annotations")
+        print(f"[Dataset] SQLite DB built. {len(sequence_infos)} sequences | "
+              f"{len(self.all_samples)} frames ({n_pos} pos / {n_neg} neg) | "
+              f"{n_ann} annotations | {len(self.class_to_sample_indices)} classes indexed")
 
     def _load_index_from_db(self):
         from tqdm import tqdm
-        
+
         conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Load the sequence map
+        c    = conn.cursor()
+
         for row in c.execute("SELECT seq_id, seq_dir, seq_name FROM seqs"):
             self.seq_map[row[0]] = (row[1], row[2])
-            
-        # Get total count first so the progress bar knows the denominator
+
         c.execute("SELECT COUNT(*) FROM annots")
         total_rows = c.fetchone()[0]
-        
-        # Load the lightweight integer index with a progress bar
+
         c.execute("SELECT seq_id, frame_idx FROM annots")
         for row in tqdm(c, total=total_rows, desc="[Dataset] Loading Index from DB", leave=False):
             self.all_samples.append((row[0], row[1]))
-            
+
+        for row in c.execute("SELECT sample_idx, category_id FROM frame_classes"):
+            self.class_to_sample_indices[row[1]].append(row[0])
+
+        if self.class_to_sample_indices:
+            n_pairs = sum(len(v) for v in self.class_to_sample_indices.values())
+            print(f"[Dataset] Class index loaded: {len(self.class_to_sample_indices)} classes, "
+                  f"{n_pairs} annotated frame-class pairs")
+
         conn.close()
 
     def clear_caches(self):
         self.frame_cache.clear()
-        self.cache_max_size = 0  
         if self.acoustic_extractor is not None:
             self.acoustic_extractor.clear_cache()
-            
+
     def __del__(self):
         if self.db_conn is not None:
             self.db_conn.close()
@@ -220,7 +238,7 @@ class EnergySegDataset(Dataset):
             if img.size != (self.img_w, self.img_h):
                 img = img.resize((self.img_w, self.img_h), Image.BILINEAR)
             arr = np.array(img, dtype=np.float32) / 255.0
-            rgb = torch.from_numpy(arr).permute(2, 0, 1)          
+            rgb = torch.from_numpy(arr).permute(2, 0, 1)
         else:
             if warn_missing:
                 print(f"[WARN] Frame not found — using noise: {path}")
@@ -228,8 +246,8 @@ class EnergySegDataset(Dataset):
             rgb = torch.from_numpy(rng.random((3, self.img_h, self.img_w), dtype=np.float32))
 
         wav_path = wav_path_from_seq_dir(seq_dir, self.frames_base, self.mic_base)
-        acoustic = self.acoustic_extractor.get_frame_bands(wav_path, frame_idx)   
-        tensor = torch.cat([rgb, acoustic], dim=0)                 
+        acoustic = self.acoustic_extractor.get_frame_bands(wav_path, frame_idx)
+        tensor   = torch.cat([rgb, acoustic], dim=0)
 
         if self.cache_max_size > 0:
             self.frame_cache[key] = tensor
@@ -242,12 +260,13 @@ class EnergySegDataset(Dataset):
         indices = sorted(frame_indices)
         if len(indices) > self.cache_max_size:
             return
-            
-        if verbose: print(f"[INFO] Pre-caching {len(indices)} frames …")
+
+        if verbose:
+            print(f"[INFO] Pre-caching {len(indices)} frames …")
         missing = sum(1 for fi in indices if not os.path.isfile(frame_path(seq_dir, seq_name, fi)))
         for fi in indices:
             self.load_frame_tensor(seq_dir, seq_name, fi, warn_missing=(missing < 10))
-            
+
         if verbose:
             found  = len(indices) - missing
             status = "all found" if missing == 0 else f"{missing} replaced with noise"
@@ -277,19 +296,19 @@ class EnergySegDataset(Dataset):
                     x, y, v = float(triplet[0]), float(triplet[1]), float(triplet[2])
                     xi, yi  = int(round(x)), int(round(y))
                     if 0 <= xi < self.img_w and 0 <= yi < self.img_h:
-                        energy_map[yi, xi]         = float(v)
-                        energy_mask[yi, xi]        = True
-                        combined_energy[yi, xi]    = max(combined_energy[yi, xi], float(v))
-                        combined_mask[yi, xi]      = True
+                        energy_map[yi, xi]      = float(v)
+                        energy_mask[yi, xi]     = True
+                        combined_energy[yi, xi] = max(combined_energy[yi, xi], float(v))
+                        combined_mask[yi, xi]   = True
                         xs.append(xi); ys.append(yi)
 
             if not xs:
                 continue
 
-            x0, x1 = min(xs), max(xs)
-            y0, y1 = min(ys), max(ys)
-            if x0 == x1: x1 += 1
-            if y0 == y1: y1 += 1
+            x0 = min(xs)
+            x1 = max(xs) + 1   # exclusive right
+            y0 = min(ys)
+            y1 = max(ys) + 1   # exclusive bottom
 
             boxes.append([float(x0), float(y0), float(x1), float(y1)])
             labels.append(cat)
@@ -327,29 +346,55 @@ class EnergySegDataset(Dataset):
 
     def reset_epoch(self):
         total = len(self.all_samples)
-        if self.frames_per_epoch is not None and self.frames_per_epoch < total:
-            self.current_indices = np.random.choice(total, self.frames_per_epoch, replace=False)
-        else:
-            self.current_indices = np.arange(total)
-            np.random.shuffle(self.current_indices)
+        n     = min(self.frames_per_epoch, total) if self.frames_per_epoch is not None else total
+
+        use_balanced = (
+            self.augmentor is not None
+            and bool(self.class_to_sample_indices)
+        )
+
+        if not use_balanced:
+            indices = np.arange(total)
+            np.random.shuffle(indices)
+            self.current_indices = indices[:n]
+            return
+
+        # Protect against n_uniform > total crashing replace=False
+        n_uniform  = min(n // 2, total)
+        n_balanced = n - n_uniform
+
+        uniform_part  = np.random.choice(total, n_uniform, replace=False)
+
+        classes       = list(self.class_to_sample_indices.keys())
+        balanced_part = np.empty(n_balanced, dtype=np.int64)
+        for i in range(n_balanced):
+            cls              = classes[int(np.random.randint(len(classes)))]
+            pool             = self.class_to_sample_indices[cls]
+            balanced_part[i] = pool[int(np.random.randint(len(pool)))]
+
+        self.current_indices = np.random.permutation(
+            np.concatenate([uniform_part, balanced_part])
+        )
 
     def __len__(self):
         return len(self.current_indices)
 
     def __getitem__(self, idx):
-        real_idx = self.current_indices[idx]
-        seq_id, fi = self.all_samples[real_idx]
+        real_idx          = self.current_indices[idx]
+        seq_id, fi        = self.all_samples[real_idx]
         seq_dir, seq_name = self.seq_map[seq_id]
 
-        # Fetch specifically this frame's annotation from disk on-demand
         c = self._get_db_conn().cursor()
         c.execute("SELECT data FROM annots WHERE seq_id=? AND frame_idx=?", (seq_id, fi))
-        row = c.fetchone()
+        row  = c.fetchone()
         anns = pickle.loads(row[0]) if row and row[0] else []
 
         image  = self.load_frame_tensor(seq_dir, seq_name, fi)
         target = self.build_annotation_target(anns)
-        
+
+        if self.augmentor is not None:
+            image, target = self.augmentor(image, target)
+
         return image, target
 
 def collate_fn(batch):
@@ -359,23 +404,30 @@ def worker_init_fn(worker_id):
     worker_info = torch.utils.data.get_worker_info()
     if worker_info is not None:
         dataset = worker_info.dataset
-        if hasattr(dataset, 'clear_caches'):
-            dataset.clear_caches()
+        # Only clear the RAM-heavy frame cache. Leave the acoustic cache intact
+        # so persistent workers don't repeatedly wipe their precomputed features.
+        if hasattr(dataset, "frame_cache"):
+            dataset.frame_cache.clear()
 
 
 # ── 3. MODEL COMPONENTS ───────────────────────────────────────────────────────
 
 class EnergyMaskHead(nn.Module):
-    def __init__(self, in_ch: int = 256, mid: int = 256):
+    """
+    Per-RoI energy mask predictor.
+    """
+    def __init__(self, in_ch: int = 256, mid: int = 256, dropout: float = 0.2):
         super().__init__()
         layers = []
         ch = in_ch
-        for _ in range(4):
+        for i in range(4):
             layers += [
                 nn.Conv2d(ch, mid, 3, padding=1, bias=False),
                 nn.BatchNorm2d(mid),
                 nn.ReLU(inplace=True),
             ]
+            if i in (1, 3):
+                layers.append(nn.Dropout2d(dropout))
             ch = mid
         layers += [
             nn.ConvTranspose2d(mid, mid, kernel_size=2, stride=2),
@@ -386,13 +438,24 @@ class EnergyMaskHead(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)   # [M, 1, 28, 28]
+        return self.net(x)   
+
 
 class FPNEnergyDecoder(nn.Module):
-    def __init__(self, fpn_ch: int = 256, mid: int = 128, img_w: int = 360, img_h: int = 180):
+    """
+    FPN-based full-image energy map decoder.
+    """
+    def __init__(
+        self,
+        fpn_ch: int = 256,
+        mid: int = 128,
+        img_w: int = 360,
+        img_h: int = 180,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.img_w = img_w
-        self.img_h = img_h
+        self.img_w  = img_w
+        self.img_h  = img_h
         self.lat    = nn.ModuleList([nn.Conv2d(fpn_ch, mid, 1) for _ in range(4)])
         self.smooth = nn.ModuleList([
             nn.Sequential(
@@ -406,6 +469,7 @@ class FPNEnergyDecoder(nn.Module):
             nn.Conv2d(mid, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
             nn.Conv2d(64, 32, 3, padding=1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
@@ -415,20 +479,30 @@ class FPNEnergyDecoder(nn.Module):
 
     def forward(self, fpn: dict) -> torch.Tensor:
         feats = [fpn[str(i)] for i in range(4)]
+        
         x = self.smooth[3](self.lat[3](feats[3]))
         for i in (2, 1, 0):
             x = F.interpolate(x, size=feats[i].shape[-2:], mode="nearest")
             x = self.smooth[i](x + self.lat[i](feats[i]))
+            
         x = F.interpolate(x, size=(self.img_h, self.img_w), mode="bilinear", align_corners=False)
         return self.head(x)
 
+
 class DistanceHead(nn.Module):
-    def __init__(self, feat_ch: int = 256):
+    """
+    Per-RoI distance regressor.
+    """
+    def __init__(self, feat_ch: int = 256, dropout: float = 0.3):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(feat_ch, 128), nn.ReLU(inplace=True),
-            nn.Linear(128,      64), nn.ReLU(inplace=True),
-            nn.Linear(64,        1),
+            nn.Linear(feat_ch, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -436,25 +510,35 @@ class DistanceHead(nn.Module):
 
 
 class EnergyInstanceModel(nn.Module):
-    def __init__(self, num_classes: int, n_channels: int = 12, img_w: int = 360, img_h: int = 180,
-                 energy_annot_w: float = 5.0, fullmap_annot_w: float = 10.0):
+    def __init__(
+        self,
+        num_classes: int,
+        n_channels: int = 12,
+        img_w: int = 360,
+        img_h: int = 180,
+        energy_annot_w: float = 5.0,
+        fullmap_annot_w: float = 10.0,
+    ):
         super().__init__()
-        self.img_w = img_w
-        self.img_h = img_h
-        self.energy_annot_w = energy_annot_w
+        self.img_w           = img_w
+        self.img_h           = img_h
+        self.energy_annot_w  = energy_annot_w
         self.fullmap_annot_w = fullmap_annot_w
 
         base = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
 
         old = base.backbone.body.conv1
-        new = nn.Conv2d(n_channels, old.out_channels,
-                        old.kernel_size, old.stride,
-                        old.padding, bias=(old.bias is not None))
+        new = nn.Conv2d(
+            n_channels, old.out_channels,
+            old.kernel_size, old.stride, old.padding,
+            bias=(old.bias is not None),
+        )
         with torch.no_grad():
             new.weight.data[:, :3, :, :] = old.weight.data
             import torch.nn.init as init
             init.kaiming_uniform_(new.weight.data[:, 3:, :, :], a=0)
-            new.weight.data[:, 3:, :, :] *= 0.01
+            # FIX: Use 0.1 scale instead of 0.01 to allow acoustic filters to learn efficiently
+            new.weight.data[:, 3:, :, :] *= 0.1 
             if old.bias is not None:
                 new.bias.data.copy_(old.bias.data)
         base.backbone.body.conv1 = new
@@ -466,28 +550,47 @@ class EnergyInstanceModel(nn.Module):
         base.roi_heads.mask_head      = None
         base.roi_heads.mask_predictor = None
 
-        base.transform.min_size = (min(img_h, img_w),)
-        base.transform.max_size = max(img_h, img_w) * 4
-        # Robust handling depending on arbitrary n_channels
-        base.transform.image_mean = [0.485, 0.456, 0.406] + [0.5] * (n_channels - 3) 
+        base.transform.min_size   = (min(img_h, img_w),)
+        base.transform.max_size   = max(img_h, img_w) * 4
+        base.transform.image_mean = [0.485, 0.456, 0.406] + [0.5]  * (n_channels - 3)
         base.transform.image_std  = [0.229, 0.224, 0.225] + [0.25] * (n_channels - 3)
 
-        self.det = base
+        self.det             = base
         self.energy_roi_pool = MultiScaleRoIAlign(
-            featmap_names=['0', '1', '2', '3'], output_size=14, sampling_ratio=2)
-        self.energy_head    = EnergyMaskHead(in_ch=256, mid=256)
-        self.energy_decoder = FPNEnergyDecoder(fpn_ch=256, mid=128, img_w=img_w, img_h=img_h)
-        self.distance_head  = DistanceHead(feat_ch=256)
+            featmap_names=["0","1","2","3"], output_size=14, sampling_ratio=2)
+        self.energy_head     = EnergyMaskHead(in_ch=256, mid=256, dropout=0.2)
+        self.energy_decoder  = FPNEnergyDecoder(fpn_ch=256, mid=128, img_w=img_w, img_h=img_h, dropout=0.1)
+        self.distance_head   = DistanceHead(feat_ch=256, dropout=0.3)
 
     def _fpn4(self, features: dict) -> dict:
-        return {k: features[k] for k in ('0','1','2','3') if k in features}
+        return {k: features[k] for k in ("0","1","2","3") if k in features}
+
+    @staticmethod
+    def _jitter_boxes(
+        boxes: torch.Tensor,
+        img_h: int,
+        img_w: int,
+        jitter_frac: float = 0.1,
+    ) -> torch.Tensor:
+        if boxes.shape[0] == 0:
+            return boxes
+        w      = (boxes[:, 2] - boxes[:, 0]).clamp(min=1.0)
+        h      = (boxes[:, 3] - boxes[:, 1]).clamp(min=1.0)
+        scale  = torch.stack([w, h, w, h], dim=1) * jitter_frac
+        delta  = (torch.rand_like(scale) * 2.0 - 1.0) * scale
+        jittered        = boxes + delta
+        jittered[:, 0] = jittered[:, 0].clamp(min=0.0, max=float(img_w) - 1.0)
+        jittered[:, 1] = jittered[:, 1].clamp(min=0.0, max=float(img_h) - 1.0)
+        jittered[:, 2] = torch.maximum(jittered[:, 2], jittered[:, 0] + 1.0).clamp_max(float(img_w))
+        jittered[:, 3] = torch.maximum(jittered[:, 3], jittered[:, 1] + 1.0).clamp_max(float(img_h))
+        return jittered
 
     def _roi_energy(self, features: dict, box_lists: list, image_sizes: list):
         M      = sum(len(b) for b in box_lists)
         device = next(iter(features.values())).device
         if M == 0:
             return (torch.zeros(0, 28, 28, device=device),
-                    torch.zeros(0, device=device))
+                    torch.zeros(0,         device=device))
 
         roi_feats   = self.energy_roi_pool(features, box_lists, image_sizes)
         energy_flat = self.energy_head(roi_feats).squeeze(1)
@@ -495,24 +598,37 @@ class EnergyInstanceModel(nn.Module):
         dist_flat   = self.distance_head(dist_feat)
         return energy_flat, dist_flat
 
-    def _gt_roi_energy_targets(self, targets: list, device: torch.device):
+    def _gt_roi_energy_targets(
+        self,
+        targets: list,
+        gt_boxes_t: list,
+        img_sizes: list,
+        orig_sizes: list,
+        device: torch.device,
+    ) -> tuple:
         e_list, m_list = [], []
-        for tgt in targets:
-            boxes   = tgt["boxes"]
-            emaps   = tgt["energy_maps"]
-            emasks  = tgt["energy_masks"]
-            for n in range(len(boxes)):
-                x0, y0, x1, y1 = [max(0, int(v.item())) for v in boxes[n]]
-                x1 = min(x1 + 1, self.img_w)
-                y1 = min(y1 + 1, self.img_h)
+
+        for tgt, boxes_t, (th, tw), (oh, ow) in zip(
+            targets, gt_boxes_t, img_sizes, orig_sizes
+        ):
+            emaps  = tgt["energy_maps"]    
+            emasks = tgt["energy_masks"]   
+
+            for n in range(len(boxes_t)):
+                x0 = max(0,  int(math.floor(boxes_t[n, 0].item() * ow / tw)))
+                y0 = max(0,  int(math.floor(boxes_t[n, 1].item() * oh / th)))
+                x1 = min(ow, int(math.ceil (boxes_t[n, 2].item() * ow / tw)))
+                y1 = min(oh, int(math.ceil (boxes_t[n, 3].item() * oh / th)))
+
                 if x1 <= x0 or y1 <= y0:
                     e_list.append(torch.zeros(1, 1, 28, 28, device=device))
                     m_list.append(torch.zeros(1, 1, 28, 28, device=device))
                     continue
+
                 crop_e = emaps[n, y0:y1, x0:x1].unsqueeze(0).unsqueeze(0).to(device)
                 crop_m = emasks[n, y0:y1, x0:x1].float().unsqueeze(0).unsqueeze(0).to(device)
-                r_e = F.interpolate(crop_e, (28, 28), mode='bilinear', align_corners=False)
-                r_m = F.interpolate(crop_m, (28, 28), mode='bilinear', align_corners=False)
+                r_e = F.interpolate(crop_e, (28, 28), mode="bilinear", align_corners=False)
+                r_m = F.interpolate(crop_m, (28, 28), mode="bilinear", align_corners=False)
                 e_list.append(r_e)
                 m_list.append(r_m)
 
@@ -526,28 +642,33 @@ class EnergyInstanceModel(nn.Module):
         orig_sizes = [img.shape[-2:] for img in images]
 
         images_t, targets_t = self.det.transform(images, targets)
-        img_sizes = images_t.image_sizes
+        img_sizes   = images_t.image_sizes
 
-        features = self.det.backbone(images_t.tensors)
-        fpn4     = self._fpn4(features)
+        features    = self.det.backbone(images_t.tensors)
+        fpn4        = self._fpn4(features)
         full_energy = self.energy_decoder(fpn4)
 
         if is_train:
             device = images_t.tensors.device
 
-            proposals,  rpn_losses = self.det.rpn(images_t, features, targets_t)
-            _,          roi_losses = self.det.roi_heads(features, proposals, img_sizes, targets_t)
+            proposals, rpn_losses = self.det.rpn(images_t, features, targets_t)
+            _,         roi_losses = self.det.roi_heads(features, proposals, img_sizes, targets_t)
 
-            gt_boxes = [tgt["boxes"].to(device) for tgt in targets]
-            energy_flat, dist_flat = self._roi_energy(fpn4, gt_boxes, img_sizes)
+            gt_boxes_t = [
+                self._jitter_boxes(tgt["boxes"].to(device), h, w)
+                for tgt, (h, w) in zip(targets_t, img_sizes)
+            ]
+            energy_flat, dist_flat = self._roi_energy(fpn4, gt_boxes_t, img_sizes)
 
-            gt_e, gt_m = self._gt_roi_energy_targets(targets, device)
+            gt_e, gt_m = self._gt_roi_energy_targets(
+                targets, gt_boxes_t, img_sizes, orig_sizes, device
+            )
             M = energy_flat.shape[0]
 
             if M > 0:
-                pred    = energy_flat.unsqueeze(1)
+                pred        = energy_flat.unsqueeze(1)
                 loss_e_base = F.mse_loss(pred, gt_e)
-                ann_px = (gt_m > 0.5)
+                ann_px      = gt_m > 0.5
                 if ann_px.any():
                     loss_e_ann = F.mse_loss(pred[ann_px], gt_e[ann_px])
                 else:
@@ -567,9 +688,8 @@ class EnergyInstanceModel(nn.Module):
                 pred_i = full_energy[i, 0]
                 gt_v   = tgt["vmap"].to(device)
                 vm     = tgt["vmask"].to(device)
-
-                W = torch.ones_like(pred_i)
-                W[vm] = self.fullmap_annot_w
+                W      = torch.ones_like(pred_i)
+                W[vm]  = self.fullmap_annot_w
                 vmap_loss = vmap_loss + (W * (pred_i - gt_v).pow(2)).mean()
 
             vmap_loss = vmap_loss / max(len(targets), 1)
@@ -586,8 +706,8 @@ class EnergyInstanceModel(nn.Module):
             proposals,        _ = self.det.rpn(images_t, features, None)
             detections_raw,   _ = self.det.roi_heads(features, proposals, img_sizes, None)
 
-            all_boxes  = [raw["boxes"] for raw in detections_raw]
-            counts     = [len(b) for b in all_boxes]
+            all_boxes = [raw["boxes"] for raw in detections_raw]
+            counts    = [len(b) for b in all_boxes]
 
             if sum(counts) > 0:
                 e_flat, d_flat = self._roi_energy(fpn4, all_boxes, img_sizes)
@@ -627,11 +747,29 @@ class InstanceTracker:
         full_e = det.get("full_energy", torch.zeros(self.img_h, self.img_w))
         N      = len(boxes)
 
+        def _track_to_result(tid: int, coasting: bool) -> dict:
+            trk = self.tracks[tid]
+            return dict(
+                track_id    = tid,
+                label       = trk["label"],
+                # Preserve the last known score for coasting tracks
+                score       = trk.get("last_score", 0.0) if coasting else None,
+                box         = trk["box"].tolist(),
+                energy_map  = trk["energy_map"],
+                dist_pred   = trk["dist_pred"],
+                full_energy = trk["full_energy"],
+                coasting    = coasting,
+            )
+
         if N == 0:
-            for d in self.tracks.values(): d["age"] += 1
-            dead = [t for t, d in self.tracks.items() if d["age"] > self.max_age]
-            for t in dead: del self.tracks[t]
-            return []
+            results = []
+            for tid in list(self.tracks.keys()):
+                self.tracks[tid]["age"] += 1
+                if self.tracks[tid]["age"] > self.max_age:
+                    del self.tracks[tid]
+                else:
+                    results.append(_track_to_result(tid, coasting=True))
+            return results
 
         track_ids   = list(self.tracks.keys())
         track_boxes = (torch.stack([self.tracks[t]["box"] for t in track_ids])
@@ -647,11 +785,13 @@ class InstanceTracker:
                 if iou_mat[r, c] >= self.iou_thr:
                     tid = track_ids[r]
                     self.tracks[tid].update(
-                        box=boxes[c].cpu(), age=0,
-                        label=int(labels[c]),
-                        energy_map=(emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
-                        dist_pred=(float(dists[c]) if c < dists.shape[0] else 0.0),
-                        full_energy=full_e,
+                        box         = boxes[c].cpu(),
+                        age         = 0,
+                        label       = int(labels[c]),
+                        energy_map  = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
+                        dist_pred   = (float(dists[c]) if c < dists.shape[0] else 0.0),
+                        full_energy = full_e,
+                        last_score  = float(scores[c]), # Cache last known score
                     )
                     self.tracks[tid]["hits"] += 1
                     matched_det[c] = tid
@@ -661,12 +801,13 @@ class InstanceTracker:
             if c not in matched_det:
                 tid = self._nxt; self._nxt += 1
                 self.tracks[tid] = dict(
-                    box        = boxes[c].cpu(),
-                    age        = 0, hits=1,
-                    label      = int(labels[c]),
-                    energy_map = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
-                    dist_pred  = (float(dists[c]) if c < dists.shape[0] else 0.0),
-                    full_energy= full_e,
+                    box         = boxes[c].cpu(),
+                    age         = 0, hits=1,
+                    label       = int(labels[c]),
+                    energy_map  = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
+                    dist_pred   = (float(dists[c]) if c < dists.shape[0] else 0.0),
+                    full_energy = full_e,
+                    last_score  = float(scores[c]), # Cache last known score
                 )
                 matched_det[c] = tid
 
@@ -678,14 +819,13 @@ class InstanceTracker:
 
         results = []
         for c in range(N):
-            tid = matched_det.get(c, -1)
-            results.append(dict(
-                track_id   = tid,
-                label      = int(labels[c]),
-                score      = float(scores[c]),
-                box        = boxes[c].cpu().tolist(),
-                energy_map = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
-                dist_pred  = (float(dists[c]) if c < dists.shape[0] else 0.0),
-                full_energy= full_e,
-            ))
+            tid = matched_det[c]
+            r   = _track_to_result(tid, coasting=False)
+            r["score"] = float(scores[c])
+            results.append(r)
+
+        for r_idx, tid in enumerate(track_ids):
+            if r_idx not in matched_trk and tid in self.tracks:
+                results.append(_track_to_result(tid, coasting=True))
+
         return results
