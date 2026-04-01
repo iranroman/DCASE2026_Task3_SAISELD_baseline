@@ -2,8 +2,7 @@
 acoustic_features.py
 ====================
 Converts 4-channel eigenmike recordings into 9-band equirectangular acoustic
-images using UpLAM, loading ONLY the audio slice required for a single video
-frame — no full-file pre-processing.
+images using UpLAM, loading ONLY the audio slice required for a single video frame.
 
 Alignment maths
 ---------------
@@ -49,7 +48,7 @@ FS                 = 24000   # expected sample rate of all WAV files
 # ── Derived timing constants ──────────────────────────────────────────────────
 # These mirror the defaults inside get_visibility_matrix / form_visibility.
 # If you ever change T_sti there, change it here too.
-T_STI_S            = 10e-3                          # 10 ms per STI frame
+T_STI_S            = 10e-3                              # 10 ms per STI frame
 N_STFT             = int(FS * T_STI_S)              # 240 samples per STI frame
 N_BLK              = 10                             # STI frames per visibility frame
 SAMPLES_PER_FRAME  = N_BLK * N_STFT                # 2400 samples per video/vis frame
@@ -90,12 +89,18 @@ def _latent_to_equirect_single(latent_np: np.ndarray) -> np.ndarray:
     """
     n_bands, N_px = latent_np.shape
     out = np.zeros((n_bands, IMG_H, IMG_W), dtype=np.float32)
+    
+    # 1. Scatter to 2D grid
     for b in range(n_bands):
-        band = latent_np[b]                              # (N_px,)
-        img  = band[_NN_IDX].reshape(IMG_H, IMG_W)      # scatter to 2-D
-        img  = img[:, ::-1].copy()                       # horizontal flip
-        mx   = img.max()
-        out[b] = img / mx if mx > 1e-10 else img
+        band = latent_np[b]                               # (N_px,)
+        img  = band[_NN_IDX].reshape(IMG_H, IMG_W)       # scatter to 2-D
+        out[b] = img[:, ::-1]                            # horizontal flip
+        
+    # 2. Global Normalization (Preserves relative inter-band energy)
+    global_max = out.max()
+    if global_max > 1e-10:
+        out /= global_max
+        
     return out
 
 
@@ -132,8 +137,11 @@ class AcousticFeatureExtractor:
       4. The result is projected to equirectangular and returned as a tensor.
 
     A small LRU result-cache keyed by (wav_path, frame_idx) avoids repeating
-    the UpLAM call when the DataLoader happens to request the same frame twice
-    (e.g. two workers, or repeated access within the same batch).
+    the UpLAM call when a specific worker requests the same frame twice
+    (e.g. repeated access via dataset repeats or intra-batch augmentations).
+    
+    NOTE: Because DataLoader workers operate in isolated memory spaces, 
+    this cache is local to each worker, not shared across num_workers.
 
     Parameters
     ----------
@@ -144,7 +152,7 @@ class AcousticFeatureExtractor:
         Must match the UpLAM model's num_bands (default 9).
     result_cache_size : int
         How many (wav, frame) results to keep in RAM.  Each entry is
-        ~9 * 180 * 360 * 4 bytes ≈ 2.3 MB, so 128 entries ≈ 300 MB.
+        ~9 * 180 * 360 * 4 bytes ≈ 2.3 MB, so 128 entries ≈ 300 MB per worker.
     """
 
     def __init__(
@@ -210,21 +218,13 @@ class AcousticFeatureExtractor:
             frames      = SAMPLES_PER_FRAME,
             always_2d   = True,
             dtype       = "float32",
-            fill_value  = 0.0,   # pads with silence at end-of-file
+            fill_value  = 0.0,   # handles zero-padding at EOF natively
         )
         # audio_slice: (SAMPLES_PER_FRAME, n_channels)
 
         # ── 2. Channel selection ──────────────────────────────────────────────
         if audio_slice.shape[1] > len(_UPLAM_MIC_INDICES_):
             audio_slice = audio_slice[:, _UPLAM_MIC_INDICES_]
-
-        # Guard: if the file ended before we got a full frame, pad to exact length
-        if audio_slice.shape[0] < SAMPLES_PER_FRAME:
-            pad = np.zeros(
-                (SAMPLES_PER_FRAME - audio_slice.shape[0], audio_slice.shape[1]),
-                dtype=np.float32,
-            )
-            audio_slice = np.vstack([audio_slice, pad])
 
         # ── 3. Visibility matrix ──────────────────────────────────────────────
         # get_visibility_matrix on SAMPLES_PER_FRAME samples produces exactly
@@ -235,7 +235,7 @@ class AcousticFeatureExtractor:
         # S_np: (n_bands, n_vis_frames, N_ch, N_ch)
 
         if S_np.shape[1] == 0:
-            # Degenerate slice (all zeros / too short after padding edge case)
+            # Degenerate slice (all zeros)
             return torch.zeros(self.num_bands, IMG_H, IMG_W, dtype=torch.float32)
 
         # ── 4. UpLAM ─────────────────────────────────────────────────────────
