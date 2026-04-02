@@ -1,124 +1,241 @@
-This repository contains a multimodal deep learning pipeline designed to perform instance segmentation, energy mapping, and distance estimation using both visual and spatial audio data. 
+# DCASE 2026 Task 3 — Semantic Acoustic Imaging for SELD: Baseline System
 
-The pipeline fuses RGB video with spatial audio for deep acoustic imaging. The audio is processed via [**UpLAM** (Latent Acoustic Mapping)](https://ccrma.stanford.edu/~iran/papers/Roman_et_al_WASPAA_2025.pdf), a self-supervised framework that leverages a complex-valued deep back-projection network (CDBPN) to upsample standard 4-channel audio into a 32-channel representation that is used to generate 9-band equirectangular acoustic images. These dense acoustic features are concatenated with RGB frames and fed into our modified **Mask R-CNN** (`EnergyInstanceModel`). Custom sub-networks replace the standard mask head to predict:
-1. **Energy Masks** (Pixel-wise acoustic energy localization)
-2. **Full-Image Energy Maps** (Global energy distribution)
-3. **Source Distance** (Regression based on RoI features)
+Multimodal instance segmentation pipeline for the [DCASE 2026 Task 3](https://dcase.community/challenge2026/task-semantic-acoustic-imaging-for-sound-event-localization-and-detection-from-spatial-audio-and-audiovisual-scenes) challenge. The system fuses RGB equirectangular frames with spatial audio to produce per-instance segmentation masks, acoustic energy fields, and source distance estimates on a 360×180 canvas at 10 FPS.
+
+## How It Works
+
+4-channel audio (tetrahedral mic array) is upsampled by [**UpLAM**](https://ccrma.stanford.edu/~iran/papers/Roman_et_al_WASPAA_2025.pdf) — a self-supervised complex-valued deep back-projection network — into a 9-band equirectangular acoustic feature map. These 9 channels are concatenated with the 3 RGB channels to form a 12-channel input tensor, which is processed by `EnergyInstanceModel` — a modified Mask R-CNN whose mask head is replaced by three sub-networks predicting:
+
+1. **Energy masks** — 28×28 per-instance acoustic energy grids (sparsified to top-K peaks at export)
+2. **Full-image energy maps** — global 360×180 energy fields
+3. **Source distance** — scalar range regression from RoI-pooled features
+
+A frame-level `InstanceTracker` links detections across time via IoU-constrained Hungarian assignment, applies score decay during coasting, and suppresses short-lived spurious tracks.
+
+* **Audio-only mode** (Track A): RGB channels are zeroed; only acoustic features are used.
+* **Audiovisual mode** (Track B): RGB and acoustic channels are used jointly.
 
 ---
 
-## 🛠️ Setup & Installation
+## Repository Structure
 
-This project requires a specific directory structure to align the 10 FPS video frames with the corresponding acoustic images.
+```text
+.
+├── model.py                # EnergyInstanceModel, InstanceTracker, dataset utilities
+├── acoustic_features.py    # AcousticFeatureExtractor (UpLAM wrapper)
+├── train.py                # Training loop
+├── run_inference.py        # Batch inference → submission JSON files
+├── evaluate.py             # Evaluation: Mask mAP, Pearson r, RDE
+├── UpLAM.pth               # Pre-trained UpLAM checkpoint (place here or set path)
+└── experiments/            # Created automatically during training
+    └── <run_name>/
+        ├── energy_seg_best.pth
+        ├── train.log
+        ├── inference.log
+        ├── eval_summary.txt
+        └── inference_outputs/
+            └── <seq_name>_inference.json
+```
 
-### 1. Prerequisites
-* **Conda:** Recommended for environment management.
-* **FFmpeg:** Required for extracting frames from the raw dataset videos. (Install via `sudo apt install ffmpeg` on Ubuntu or `brew install ffmpeg` on macOS).
-* [STARSS23 Dataset](https://zenodo.org/records/7880637)
-* The pre-trained UpLAM.pth model checkpoint is provided here, but can also be found in [the model's original repository](https://github.com/adrianSRoman/LAM)
+---
 
-### 2. Environment Setup
-The codebase was developed and tested on **Python 3.10.19**. To avoid dependency conflicts (especially with spatial mapping libraries), create a dedicated Conda environment:
+## Setup
+
+### Requirements
+- Python 3.10.19
+- CUDA-capable GPU (baseline developed on A100-40GB; batch size defaults assume this)
+- FFmpeg (for frame extraction)
+- [STARSS23 dataset](https://zenodo.org/records/7880637) + [STAIRS26 labels](https://doi.org/10.5281/zenodo.18171005)
+
+### Environment
 
 ```bash
-# Create and activate the conda environment
 conda create -n saiseld_env python=3.10.19 -y
 conda activate saiseld_env
-```
 
-Install PyTorch and Torchvision. *(Note: Adjust the CUDA version below to match your local hardware).*
-
-```bash
-# Example for CUDA 11.8. 
+# Adjust cuda version to match your hardware
 conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
-```
 
-Install the remaining Python dependencies:
-
-```bash
-# Core math, audio, and imaging libraries
-pip install numpy scipy soundfile librosa scikit-image scikit-learn Pillow tqdm
-
-# Astropy and Basemap are required for equirectangular projections
+pip install numpy scipy soundfile librosa scikit-image scikit-learn Pillow tqdm pycocotools
 pip install astropy matplotlib basemap
 ```
 
-### 3. Data Preparation (STARSS23)
-The data loader (`EnergySegDataset`) expects a very specific directory structure where video frames, JSON labels, and WAV mic files mirror each other's split and sequence names.
+### Hardcoded Paths
 
-Your project root must look exactly like this before running `train.py`:
+The following constants appear at the top of `train.py`, `run_inference.py`, and `evaluate.py` and **must be updated** to match your filesystem before running anything:
 
-```text
-├── checkpoints/
-│   └── UpLAM.pth                # Pre-trained UpLAM weights
-├── STARSS23/
-│   ├── labels_dev/              # Ground truth JSONs
-│   │   ├── train/
-│   │   │   └── fold1_room1_mix001.json
-│   │   └── test/
-│   ├── mic_dev/                 # 4-channel eigenmike WAVs (24kHz)
-│   │   ├── train/
-│   │   │   └── fold1_room1_mix001.wav
-│   │   └── test/
-│   └── frames_dev/              # Extracted RGB frames (10 FPS)
-│       ├── train/
-│       │   └── fold1_room1_mix001/
-│       │       ├── fold1_room1_mix001_0000.png
-│       │       ├── fold1_room1_mix001_0001.png
-│       │       └── ...
-│       └── test/
+```python
+FRAMES_BASE      = "/data3/scratch/eez086/STARSS23/frames_dev"
+LABELS_BASE      = "/data3/scratch/eez086/STARSS23/labels_dev"
+MIC_BASE         = "/data3/scratch/eez086/STARSS23/mic_dev"
+UPLAM_CHECKPOINT = "UpLAM.pth"
 ```
 
-### 4. Extracting Frames from Video
+---
 
-The audio feature extractor (`acoustic_features.py`) calculates visibility matrices using exactly 2400 samples per video frame (assuming a 24,000 Hz sample rate). This corresponds strictly to **10 Frames Per Second (FPS)** during video preprocessing.
+## Data Preparation
 
-Each video must therefore be converted into 10 FPS frames and resized to **360×180**.
-
-Assuming the raw STARSS23 videos are downloaded into the `STARSS23/video_dev/` directory, your input structure should look like this:
+### Expected Directory Layout
 
 ```text
-video_dev/
-├── dev-test-tau/
-│   ├── fold4_room10_mix001.mp4
-│   ├── fold4_room10_mix002.mp4
-│   └── ...
-├── dev-train-tau/
-│   ├── fold1_room1_mix001.mp4
-│   └── ...
+STARSS23/
+├── labels_dev/                 # STAIRS26 JSON annotation files
+│   ├── train/
+│   │   └── fold1_room1_mix001.json
+│   └── test/
+├── mic_dev/                    # 4-channel WAV files, 24 kHz
+│   ├── train/
+│   │   └── fold1_room1_mix001.wav
+│   └── test/
+└── frames_dev/                 # Extracted RGB frames (10 FPS, 360×180)
+    ├── train/
+    │   └── fold1_room1_mix001/
+    │       ├── fold1_room1_mix001_0000.png
+    │       ├── fold1_room1_mix001_0001.png
+    │       └── ...
+    └── test/
 ```
 
-**Output Structure**
+Frame filenames must follow the pattern `{sequence_name}_{frame_index:04d}.png` with **zero-based indexing** (frame 0 = `_0000.png`) to match `metadata_frame_index` values in the JSON annotations.
 
-Frames will be written to a parallel directory tree at `STARSS23/frames_dev/`. Each video receives its own directory, and frame filenames preserve the original sequence name:
+### Extracting Frames
 
-```text
-frames_dev/
-├── dev-test-tau/
-│   ├── fold4_room10_mix001/
-│   │   ├── fold4_room10_mix001_0000.png
-│   │   ├── fold4_room10_mix001_0001.png
-│   │   └── ...
-│   ├── fold4_room10_mix002/
-│   │   └── ...
-│   └── ...
-```
-
-**One-Line Frame Extraction Command**
-
-Navigate into your `STARSS23` directory and run the following command:
+Place raw STARSS23 videos under `STARSS23/video_dev/`, then from inside `STARSS23/` run:
 
 ```bash
-find video_dev -type f -name "*.mp4" -exec bash -c 'rel="${1#video_dev/}"; base="$(basename "$rel" .mp4)"; outdir="frames_dev/$(dirname "$rel")/$base"; mkdir -p "$outdir"; ffmpeg -hide_banner -loglevel error -i "$1" -vf "fps=10,scale=360:180" "$outdir/${base}_%04d.png"' _ {} \;
+find video_dev -type f -name "*.mp4" -exec bash -c '
+  rel="${1#video_dev/}"
+  base="$(basename "$rel" .mp4)"
+  outdir="frames_dev/$(dirname "$rel")/$base"
+  mkdir -p "$outdir"
+  ffmpeg -hide_banner -loglevel error -i "$1" \
+    -vf "fps=10,scale=360:180" \
+    -start_number 0 \
+    "$outdir/${base}_%04d.png"
+' _ {} \;
 ```
 
-**What This Command Does:**
-For every `.mp4` file inside `video_dev`:
-1.  **Finds all videos recursively** (supports nested directories).
-2.  **Recreates the same directory structure** inside `frames_dev`.
-3.  **Creates a specific folder** for each video sequence.
-4.  **Extracts frames at exactly 10 FPS** (`fps=10`).
-5.  **Resizes each frame** to 360×180 (`scale=360:180`).
-6.  **Names frames sequentially**, starting at 0001 (`%04d.png`).
+*Note: The `-start_number 0` flag is critical. It ensures the first extracted frame is `_0000.png`. Without it, FFmpeg defaults to `_0001.png`, causing frame 0 to fall back to synthetic noise in the data loader.*
 
-*(Example Output: `frames_dev/dev-test-tau/fold4_room10_mix001/fold4_room10_mix001_0001.png`)*
+---
+
+## Training
+
+```bash
+python train.py --exp_name my_run
+```
+
+**Key arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--exp_name` | **required** | Name for the experiment directory under `experiments/` |
+| `--split` | `train` | Dataset split to train on |
+| `--num_classes` | `14` | 13 sound classes + background |
+| `--batch_size` | `4` | Sequences per batch |
+| `--num_workers` | auto | DataLoader workers (capped at 16, 1 core reserved) |
+| `--audio_only` | `False` | Zero out RGB channels (Track A mode) |
+
+Checkpoints are saved to `experiments/<exp_name>/energy_seg_best.pth` whenever validation loss improves. Training logs are written to `experiments/<exp_name>/train.log`.
+
+---
+
+## Inference
+
+Runs the trained model on all sequences in a dataset split and writes one submission-format JSON file per sequence.
+
+```bash
+python run_inference.py --exp_dir experiments/my_run
+```
+
+**Key arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--exp_dir` | **required** | Path to the experiment directory |
+| `--checkpoint` | `<exp_dir>/energy_seg_best.pth` | Override checkpoint path |
+| `--split` | `test` | Dataset split to run on |
+| `--num_seqs` | all | Randomly sample N sequences (useful for debugging) |
+| `--seed` | `42` | RNG seed for sequence sampling |
+| `--batch_size` | `32` | Frames per forward pass |
+
+### Filtering Pipeline
+
+Detections pass through five sequential stages before export:
+
+| Stage | Argument | Default | Effect |
+|---|---|---|---|
+| 1. Score threshold | `--score_thr` | `0.35` | Drop low-confidence detections |
+| 2. Per-class NMS | `--nms_iou_thr` | `0.30` | Remove spatially redundant boxes |
+| 3. Per-frame class cap | `--max_dets_per_class` | `3` | At most N detections per class per frame |
+| 4. Track confirmation | `--min_hits` | `2` | Only export tracks seen ≥ N frames |
+| 5. Energy sparsification | `--energy_top_k` | `20` | Export top-K energy points per detection |
+
+### Tracker Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--iou_thr` | `0.3` | Minimum IoU to associate a detection to an existing track |
+| `--max_age` | `5` | Frames a track can coast (no detection) before deletion |
+| `--coast_decay` | `0.9` | Score multiplier applied per coasting frame |
+
+### Output
+
+Results are written to `experiments/<exp_dir>/inference_outputs/<seq_name>_inference.json` in the DCASE 2026 Task 3 submission format. A summary of per-sequence track counts and throughput (fps) is printed to stdout and to `experiments/<exp_dir>/inference.log`.
+
+---
+
+## Evaluation
+
+Computes Mask mAP, Pearson *r*, and Relative Distance Error against the STAIRS26 ground-truth annotations. Both ground-truth and prediction segmentations are rendered into continuous 360×180 energy maps through a spherical Gaussian kernel ($\sigma = 6^\circ$) before any metric is computed, making the evaluator equally valid for dense polygon and sparse peak representations.
+
+```bash
+python evaluate.py --exp_dir experiments/my_run
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--exp_dir` | **required** | Experiment directory containing `inference_outputs/` |
+| `--gt_root` | `LABELS_BASE` | Root directory of ground-truth JSON annotations |
+| `--split` | `test` | Split to evaluate against |
+| `--sigma` | `6.0` | Gaussian kernel standard deviation in degrees of arc |
+| `--energy_thr` | `0.10` | Binary mask threshold as a fraction of peak energy |
+
+### Metrics
+
+- **Mask mAP (IoU 0.50:0.95)** — Primary ranking metric; simultaneously penalizes missed detections, false positives, mislocalization, and poor energy reconstruction.
+- **Mask AP50** — mAP at IoU ≥ 0.50 only.
+- **Pearson *r*** — Energy field shape fidelity over spatially matched pairs, macro-averaged across classes.
+- **RDE (%)** — Mean absolute percentage error of predicted vs. reference source distance, macro-averaged across classes.
+
+Matching uses the Hungarian algorithm with a 20° great-circle angular threshold. Cross-class matches are strictly rejected. Results are printed to stdout and saved to `experiments/<exp_dir>/eval_summary.txt`.
+
+---
+
+## Citation
+
+If you use this system or components of its architecture, please cite the following:
+
+**Baseline Architecture (UpLAM):**
+```bibtex
+@inproceedings{roman2025latent,
+  title={Latent Acoustic Mapping for Direction of Arrival Estimation: A Self-Supervised Approach},
+  author={Roman, Adrian S and Roman, Iran R and Bello, Juan P},
+  booktitle={2025 IEEE Workshop on Applications of Signal Processing to Audio and Acoustics (WASPAA)},
+  pages={1--5},
+  year={2025},
+  organization={IEEE},
+  url={[https://ccrma.stanford.edu/~iran/papers/Roman_et_al_WASPAA_2025.pdf](https://ccrma.stanford.edu/~iran/papers/Roman_et_al_WASPAA_2025.pdf)}
+}
+```
+
+**Backbone Network (Mask R-CNN):**
+```bibtex
+@inproceedings{he2017mask,
+  title={Mask {R-CNN}},
+  author={He, Kaiming and Gkioxari, Georgia and Doll{\'a}r, Piotr and Girshick, Ross},
+  booktitle={Proceedings of the IEEE International Conference on Computer Vision (ICCV)},
+  pages={2961--2969},
+  year={2017}
+}
+```
