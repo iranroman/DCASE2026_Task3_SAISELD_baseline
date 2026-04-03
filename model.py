@@ -6,6 +6,7 @@ import math
 import hashlib
 import pickle
 import sqlite3
+import types
 from collections import defaultdict, OrderedDict
 
 import numpy as np
@@ -19,7 +20,6 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.ops import box_iou, MultiScaleRoIAlign
 from scipy.optimize import linear_sum_assignment
 
-# Assumes acoustic_features is accessible in your path
 from acoustic_features import wav_path_from_seq_dir
 
 
@@ -32,7 +32,7 @@ def json_to_seq_name(json_path: str) -> str:
 def frame_path(seq_dir: str, seq_name: str, idx: int) -> str:
     return os.path.join(seq_dir, f"{seq_name}_{idx:04d}.png")
 
-def scan_available_frames(seq_dir: str, seq_name: str) -> list:
+def scan_available_frames(seq_dir: str, seq_name: str) -> list:    
     pattern = os.path.join(seq_dir, f"{seq_name}_*.png")
     out = []
     for p in sorted(glob.glob(pattern)):
@@ -62,7 +62,7 @@ def get_sequence_infos(split_keyword: str, labels_base: str, frames_base: str) -
 
 # ── 2. DATASET & CACHING ──────────────────────────────────────────────────────
 
-_DB_SCHEMA_VERSION = "v2"   
+_DB_SCHEMA_VERSION = "v3"   
 
 def _dataset_cache_fingerprint(sequence_infos: list) -> str:
     h = hashlib.md5()
@@ -229,8 +229,8 @@ class EnergySegDataset(Dataset):
 
         if key in self.frame_cache:
             tensor = self.frame_cache.pop(key)
-            self.frame_cache[key] = tensor
-            return tensor
+            self.frame_cache[key] = tensor    
+            return tensor.clone()
 
         path = frame_path(seq_dir, seq_name, frame_idx)
         if os.path.isfile(path):
@@ -254,7 +254,7 @@ class EnergySegDataset(Dataset):
             if len(self.frame_cache) > self.cache_max_size:
                 self.frame_cache.popitem(last=False)
 
-        return tensor
+        return tensor.clone()
 
     def precache_frames(self, seq_dir: str, seq_name: str, frame_indices: list, verbose: bool = True):
         indices = sorted(frame_indices)
@@ -344,12 +344,14 @@ class EnergySegDataset(Dataset):
             instance_ids = torch.tensor(iids,                            dtype=torch.int64),
         )
 
-    def reset_epoch(self):
+    # ADDED 'balanced' parameter to allow train.py to disable it dynamically
+    def reset_epoch(self, balanced: bool = True):
         total = len(self.all_samples)
         n     = min(self.frames_per_epoch, total) if self.frames_per_epoch is not None else total
 
         use_balanced = (
-            self.augmentor is not None
+            balanced
+            and self.augmentor is not None
             and bool(self.class_to_sample_indices)
         )
 
@@ -359,7 +361,6 @@ class EnergySegDataset(Dataset):
             self.current_indices = indices[:n]
             return
 
-        # Protect against n_uniform > total crashing replace=False
         n_uniform  = min(n // 2, total)
         n_balanced = n - n_uniform
 
@@ -404,8 +405,6 @@ def worker_init_fn(worker_id):
     worker_info = torch.utils.data.get_worker_info()
     if worker_info is not None:
         dataset = worker_info.dataset
-        # Only clear the RAM-heavy frame cache. Leave the acoustic cache intact
-        # so persistent workers don't repeatedly wipe their precomputed features.
         if hasattr(dataset, "frame_cache"):
             dataset.frame_cache.clear()
 
@@ -413,9 +412,6 @@ def worker_init_fn(worker_id):
 # ── 3. MODEL COMPONENTS ───────────────────────────────────────────────────────
 
 class EnergyMaskHead(nn.Module):
-    """
-    Per-RoI energy mask predictor.
-    """
     def __init__(self, in_ch: int = 256, mid: int = 256, dropout: float = 0.2):
         super().__init__()
         layers = []
@@ -442,9 +438,6 @@ class EnergyMaskHead(nn.Module):
 
 
 class FPNEnergyDecoder(nn.Module):
-    """
-    FPN-based full-image energy map decoder.
-    """
     def __init__(
         self,
         fpn_ch: int = 256,
@@ -490,9 +483,6 @@ class FPNEnergyDecoder(nn.Module):
 
 
 class DistanceHead(nn.Module):
-    """
-    Per-RoI distance regressor.
-    """
     def __init__(self, feat_ch: int = 256, dropout: float = 0.3):
         super().__init__()
         self.fc = nn.Sequential(
@@ -517,7 +507,8 @@ class EnergyInstanceModel(nn.Module):
         img_w: int = 360,
         img_h: int = 180,
         energy_annot_w: float = 5.0,
-        fullmap_annot_w: float = 10.0,
+        fullmap_annot_w: float = 10.0, # CHANGED default to 10.0 to match strategy
+        dropout: float = 0.6,
     ):
         super().__init__()
         self.img_w           = img_w
@@ -536,9 +527,7 @@ class EnergyInstanceModel(nn.Module):
         with torch.no_grad():
             new.weight.data[:, :3, :, :] = old.weight.data
             import torch.nn.init as init
-            init.kaiming_uniform_(new.weight.data[:, 3:, :, :], a=0)
-            # FIX: Use 0.1 scale instead of 0.01 to allow acoustic filters to learn efficiently
-            new.weight.data[:, 3:, :, :] *= 0.1 
+            init.kaiming_uniform_(new.weight.data[:, 3:, :, :], a=math.sqrt(5))
             if old.bias is not None:
                 new.bias.data.copy_(old.bias.data)
         base.backbone.body.conv1 = new
@@ -546,16 +535,32 @@ class EnergyInstanceModel(nn.Module):
         in_box = base.roi_heads.box_predictor.cls_score.in_features
         base.roi_heads.box_predictor = FastRCNNPredictor(in_box, num_classes)
 
+        box_head = base.roi_heads.box_head
+        if hasattr(box_head, 'fc6') and hasattr(box_head, 'fc7'):
+            def _box_head_forward(self_box, x):
+                x = x.flatten(start_dim=1)
+                x = self_box.drop1(F.relu(self_box.fc6(x)))
+                x = self_box.drop2(F.relu(self_box.fc7(x)))
+                return x
+            
+            box_head.drop1 = nn.Dropout(p=dropout)
+            box_head.drop2 = nn.Dropout(p=dropout)
+            box_head.forward = types.MethodType(_box_head_forward, box_head)
+
         base.roi_heads.mask_roi_pool  = None
         base.roi_heads.mask_head      = None
         base.roi_heads.mask_predictor = None
 
         base.transform.min_size   = (min(img_h, img_w),)
         base.transform.max_size   = max(img_h, img_w) * 4
-        base.transform.image_mean = [0.485, 0.456, 0.406] + [0.5]  * (n_channels - 3)
-        base.transform.image_std  = [0.229, 0.224, 0.225] + [0.25] * (n_channels - 3)
+        
+        base.transform.image_mean = [0.485, 0.456, 0.406] + [0.0] * (n_channels - 3)
+        base.transform.image_std  = [0.229, 0.224, 0.225] + [1.0] * (n_channels - 3)
 
-        self.det             = base
+        self.det = base
+        
+        self.acoustic_norm = nn.InstanceNorm2d(n_channels - 3, affine=True)
+
         self.energy_roi_pool = MultiScaleRoIAlign(
             featmap_names=["0","1","2","3"], output_size=14, sampling_ratio=2)
         self.energy_head     = EnergyMaskHead(in_ch=256, mid=256, dropout=0.2)
@@ -644,7 +649,15 @@ class EnergyInstanceModel(nn.Module):
         images_t, targets_t = self.det.transform(images, targets)
         img_sizes   = images_t.image_sizes
 
-        features    = self.det.backbone(images_t.tensors)
+        x = images_t.tensors
+        rgb_feats = x[:, :3, :, :]
+        acoustic_feats = x[:, 3:, :, :]
+        
+        acoustic_normed = self.acoustic_norm(acoustic_feats)
+        
+        x_normed = torch.cat([rgb_feats, acoustic_normed], dim=1)
+        features = self.det.backbone(x_normed)
+
         fpn4        = self._fpn4(features)
         full_energy = self.energy_decoder(fpn4)
 
@@ -752,7 +765,6 @@ class InstanceTracker:
             return dict(
                 track_id    = tid,
                 label       = trk["label"],
-                # Preserve the last known score for coasting tracks
                 score       = trk.get("last_score", 0.0) if coasting else None,
                 box         = trk["box"].tolist(),
                 energy_map  = trk["energy_map"],
@@ -771,18 +783,27 @@ class InstanceTracker:
                     results.append(_track_to_result(tid, coasting=True))
             return results
 
-        track_ids   = list(self.tracks.keys())
-        track_boxes = (torch.stack([self.tracks[t]["box"] for t in track_ids])
-                       if track_ids else torch.zeros(0, 4))
+        track_ids    = list(self.tracks.keys())
+        track_boxes  = (torch.stack([self.tracks[t]["box"] for t in track_ids])
+                        if track_ids else torch.zeros(0, 4))
+        
+        track_labels = np.array([self.tracks[t]["label"] for t in track_ids])
 
         iou_mat = (box_iou(track_boxes.cpu(), boxes.cpu()).numpy()
                    if track_boxes.numel() > 0 else np.zeros((0, N), dtype=np.float32))
 
         matched_det, matched_trk = {}, set()
         if iou_mat.size > 0:
-            row_ind, col_ind = linear_sum_assignment(1.0 - iou_mat)
+            cost = 1.0 - iou_mat
+            
+            for r in range(len(track_ids)):
+                for c in range(N):
+                    if track_labels[r] != int(labels[c]):
+                        cost[r, c] = 1000.0
+            
+            row_ind, col_ind = linear_sum_assignment(cost)
             for r, c in zip(row_ind, col_ind):
-                if iou_mat[r, c] >= self.iou_thr:
+                if iou_mat[r, c] >= self.iou_thr and cost[r, c] < 1000.0:
                     tid = track_ids[r]
                     self.tracks[tid].update(
                         box         = boxes[c].cpu(),
@@ -791,7 +812,7 @@ class InstanceTracker:
                         energy_map  = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
                         dist_pred   = (float(dists[c]) if c < dists.shape[0] else 0.0),
                         full_energy = full_e,
-                        last_score  = float(scores[c]), # Cache last known score
+                        last_score  = float(scores[c]), 
                     )
                     self.tracks[tid]["hits"] += 1
                     matched_det[c] = tid
@@ -807,7 +828,7 @@ class InstanceTracker:
                     energy_map  = (emaps[c].cpu() if c < emaps.shape[0] else torch.zeros(28, 28)),
                     dist_pred   = (float(dists[c]) if c < dists.shape[0] else 0.0),
                     full_energy = full_e,
-                    last_score  = float(scores[c]), # Cache last known score
+                    last_score  = float(scores[c]), 
                 )
                 matched_det[c] = tid
 

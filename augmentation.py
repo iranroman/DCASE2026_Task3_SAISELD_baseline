@@ -64,12 +64,9 @@ def _split_boundary_instances(target: dict, shift: int, img_w: int) -> dict:
     if N == 0:
         return target
 
-    # Recompute preliminary boxes to check physical width
     temp_boxes = _recompute_boxes_from_masks(masks)
     widths     = temp_boxes[:, 2] - temp_boxes[:, 0]
 
-    # An object is only split if it crosses the shift point AND its bounding 
-    # box is physically massive (> W/2), proving it wrapped around the image edges.
     has_left  = masks[:, :, :shift].flatten(1).any(dim=1)   
     has_right = masks[:, :, shift:].flatten(1).any(dim=1)   
     crosses   = has_left & has_right & (widths > img_w / 2.0)
@@ -188,7 +185,7 @@ class SeldAugmentor:
         azimuth_rotate: bool         = True,
         hflip_prob: float            = 0.5,
         max_bands_masked: int        = 2,
-        intensity_scale_range: tuple = (0.6, 1.4),
+        intensity_scale_range: tuple = (0.6, 1.4), # Left here to avoid breaking init signatures, but unused in logic.
         acoustic_noise_std: float    = 0.015,
         rgb_jitter_prob: float       = 0.8,
     ):
@@ -198,7 +195,6 @@ class SeldAugmentor:
         self.azimuth_rotate        = azimuth_rotate
         self.hflip_prob            = hflip_prob
         self.max_bands_masked      = max_bands_masked
-        self.intensity_scale_range = intensity_scale_range
         self.acoustic_noise_std    = acoustic_noise_std
         self.rgb_jitter_prob       = rgb_jitter_prob
 
@@ -213,7 +209,7 @@ class SeldAugmentor:
             image = self._rgb_jitter(image)
 
         image = self._band_mask(image)
-        image = self._acoustic_intensity_scale(image)
+        # Removed _acoustic_intensity_scale. InstanceNorm2d neutralizes it anyway.
         image = self._acoustic_noise(image)
 
         return image, target
@@ -244,26 +240,11 @@ class SeldAugmentor:
         if n_mask == 0 or self.n_acoustic == 0:
             return image
 
-        RGB_OFFSET   = 3 # Explicitly enforce the [RGB, Acoustic] tensor contract
+        RGB_OFFSET   = 3 
         band_indices = torch.randperm(self.n_acoustic)[:n_mask]
         image        = image.clone()
         for b in band_indices:
             image[RGB_OFFSET + int(b)] = 0.0
-        return image
-
-    # ------------------------------------------------------------------
-    # Acoustic intensity scaling
-    # ------------------------------------------------------------------
-
-    def _acoustic_intensity_scale(self, image: torch.Tensor) -> torch.Tensor:
-        if self.n_acoustic == 0:
-            return image
-
-        RGB_OFFSET = 3 # Explicit layout
-        lo, hi     = self.intensity_scale_range
-        scale      = lo + (hi - lo) * torch.rand(1).item()
-        image      = image.clone()
-        image[RGB_OFFSET:] = (image[RGB_OFFSET:] * scale).clamp(0.0, 1.0)
         return image
 
     # ------------------------------------------------------------------
@@ -274,10 +255,12 @@ class SeldAugmentor:
         if self.n_acoustic == 0 or self.acoustic_noise_std <= 0.0:
             return image
 
-        RGB_OFFSET = 3 # Explicit layout
+        RGB_OFFSET = 3 
         image      = image.clone()
         noise      = torch.randn_like(image[RGB_OFFSET:]) * self.acoustic_noise_std
-        image[RGB_OFFSET:] = (image[RGB_OFFSET:] + noise).clamp(0.0, 1.0)
+        
+        # Only clamp to min=0.0. Do NOT decapitate the acoustic peaks with max=1.0!
+        image[RGB_OFFSET:] = (image[RGB_OFFSET:] + noise).clamp(min=0.0)
         return image
 
     def _rgb_jitter(self, image: torch.Tensor) -> torch.Tensor:
@@ -291,7 +274,6 @@ class SeldAugmentor:
         rgb = TF.adjust_contrast(rgb,   random.uniform(0.7, 1.3))
         rgb = TF.adjust_saturation(rgb, random.uniform(0.8, 1.2))
         
-        # Explicit clamp to prevent blown-out float pixels from leaking
         image[:3] = rgb.clamp(0.0, 1.0)
         
         return image

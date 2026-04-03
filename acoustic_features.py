@@ -1,27 +1,3 @@
-"""
-acoustic_features.py
-====================
-Converts 4-channel eigenmike recordings into 9-band equirectangular acoustic
-images using UpLAM, loading ONLY the audio slice required for a single video frame.
-
-Alignment maths
----------------
-get_visibility_matrix uses T_sti = 10 ms, T_stationarity = 10 * T_sti = 100 ms.
-    N_stft           = FS * T_sti          = 24000 * 0.01  = 240 samples/STI frame
-    N_blk            = T_stationarity/T_sti = 100ms / 10ms  = 10 STI frames / vis frame
-    SAMPLES_PER_FRAME= N_blk * N_stft      = 10    * 240   = 2400 samples / vis frame
-    vis frame rate   = FS / SAMPLES_PER_FRAME               = 10 vis frames / second
-
-The video is also at 10 fps (INFERENCE_HZ = 10), so video frame index fi maps
-exactly to audio byte-offset  fi * 2400 * sizeof(float32).  One soundfile.read()
-call fetches that slice; everything else is unchanged.
-
-Usage (from the main training script)
---------------------------------------
-    from acoustic_features import AcousticFeatureExtractor, wav_path_from_seq_dir
-    ACOUSTIC = AcousticFeatureExtractor("checkpoints/UpLAM.pth", device=DEVICE)
-"""
-
 import os
 import numpy as np
 import torch
@@ -95,12 +71,7 @@ def _latent_to_equirect_single(latent_np: np.ndarray) -> np.ndarray:
         band = latent_np[b]                               # (N_px,)
         img  = band[_NN_IDX].reshape(IMG_H, IMG_W)       # scatter to 2-D
         out[b] = img[:, ::-1]                            # horizontal flip
-        
-    # 2. Global Normalization (Preserves relative inter-band energy)
-    global_max = out.max()
-    if global_max > 1e-10:
-        out /= global_max
-        
+            
     return out
 
 
