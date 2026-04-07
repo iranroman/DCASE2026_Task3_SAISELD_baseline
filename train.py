@@ -5,12 +5,14 @@ import warnings
 import math
 import random
 import argparse
+import shutil
 from collections import defaultdict
 from contextlib import contextmanager
 
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
@@ -98,24 +100,25 @@ N_CHANNELS       = 12
 N_ACOUSTIC       = 9
 NUM_CLASSES      = 14
 NUM_EPOCHS       = 200
-PATIENCE         = 10          
+
+PATIENCE           = 15         
+SCHEDULER_PATIENCE = 3
 
 TRAIN_FRAMES_PER_EPOCH = 15000
 VAL_FRAMES_PER_EPOCH   = None
 
 LR               = 1e-4
-SCORE_THR        = 0.05
 ENERGY_ANNOT_W   = 5.0
 FULLMAP_ANNOT_W  = 10.0 
 DIST_NORM        = 500.0
-ENERGY_EXPORT_THR= 0.10
-INFERENCE_HZ     = 10
-INFERENCE_SEC    = 5
+
+# ── Tripwire Constants ────────────────────────────────────────────────────────
+ENERGY_MASK_TRIPWIRE = 0.060 
+OBJ_GAP_TRIPWIRE     = 0.10
 
 # ── Backbone progressive-unfreezing schedule ──────────────────────────────────
-UNFREEZE_LAYER4_EPOCH = 2
-UNFREEZE_LAYER3_EPOCH = 4   
-PHASE_GRACE = 4
+UNFREEZE_LAYER4_EPOCH = 3
+UNFREEZE_LAYER3_EPOCH = 7
 
 
 # ── Device Setup ──────────────────────────────────────────────────────────────
@@ -153,13 +156,30 @@ def eval_behavior_for_loss(model):
 def apply_backbone_freeze(model: nn.Module, epoch: int):
     body = model.det.backbone.body
 
-    for p in list(body.conv1.parameters()) + list(body.bn1.parameters()):
-        p.requires_grad = True
-
-    for module in [body.layer1, body.layer2]:
+    # Explicitly exempt the new DualModalityStem modules and normalizers
+    always_trainable = [
+        body.conv1.conv1_rgb,
+        body.conv1.conv1_audio,
+        body.bn1,
+        model.acoustic_norm
+    ]
+    for module in always_trainable:
         for p in module.parameters():
-            p.requires_grad = False
+            p.requires_grad = True
+            
+    # Explicitly exempt the learnable stem variables
+    body.conv1.rgb_scale.requires_grad = True
+    body.conv1.audio_raw.requires_grad = True
 
+    # Layer 1 explicitly unfrozen from Epoch 1 to learn audio-visual vocabulary
+    for p in body.layer1.parameters():
+        p.requires_grad = True
+        
+    # Layer 2 permanently frozen for audiotuned7
+    for p in body.layer2.parameters():
+        p.requires_grad = False
+
+    # Progressive unfreezing from top to bottom
     layer4_active = epoch >= UNFREEZE_LAYER4_EPOCH
     for p in body.layer4.parameters():
         p.requires_grad = layer4_active
@@ -171,11 +191,11 @@ def apply_backbone_freeze(model: nn.Module, epoch: int):
     for p in model.det.backbone.fpn.parameters():
         p.requires_grad = True
 
-    phase = "heads+FPN only"
-    if layer3_active:
-        phase = "layer3+4 + heads+FPN"
-    elif layer4_active:
-        phase = "layer4 + heads+FPN"
+    # Dynamically build the phase string so it's always accurate and numerically sorted
+    active_layers = ["1"]
+    if layer3_active: active_layers.append("3")
+    if layer4_active: active_layers.append("4")
+    phase = f"layer{'+'.join(sorted(active_layers, key=int))} + heads+FPN"
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total     = sum(p.numel() for p in model.parameters())
@@ -187,11 +207,16 @@ def _get_pg(optimizer, name):
     return next(g for g in optimizer.param_groups if g.get("name") == name)
 
 def freeze_backbone_bn(model: nn.Module):
+    """
+    Dynamically freezes BN stats only for layers that are genuinely frozen.
+    Prevents corrupting the normalization of active layers like layer1.
+    """
     body = model.det.backbone.body
-    for module in [body.layer1, body.layer2]:
-        for m in module.modules():
-            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                m.eval()
+    for layer in [body.layer1, body.layer2, body.layer3, body.layer4]:
+        if not any(p.requires_grad for p in layer.parameters()):
+            for m in layer.modules():
+                if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                    m.eval()
 
 
 # ── 6. PLOTTING UTILITY ───────────────────────────────────────────────────────
@@ -278,7 +303,7 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         rgb_jitter_prob       = 0.8,
     )
     print(f"[TRAIN] Augmentation: azimuth_rotate=True | hflip_prob=0.5 | rgb_jitter=0.8 | "
-          f"max_bands_masked=4 | intensity_scale=(0.6,1.4) | acoustic_noise_std=0.03")
+          f"rgb_mask_prob=0.15 | max_bands_masked=4 | intensity_scale=(0.6,1.4) | acoustic_noise_std=0.03")
 
     # ── Datasets ──────────────────────────────────────────────────────────────
     train_dataset = EnergySegDataset(
@@ -293,6 +318,25 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         augmentor          = train_augmentor,
     )
     
+    # ── Calculate Smoothed Class Weights ──────────────────────────────────────
+    print("[TRAIN] Calculating ROI-level class weights...")
+    ann_counts = {}
+    for orig_cat_id, sample_list in train_dataset.class_to_sample_indices.items():
+        ann_counts[orig_cat_id] = len(sample_list)
+    
+    total_anns = sum(ann_counts.values())
+    num_fg_classes = NUM_CLASSES - 1
+    
+    class_weights = torch.ones(NUM_CLASSES, dtype=torch.float32, device=DEVICE)
+    for orig_cat_id, count in ann_counts.items():
+        model_cat_id = orig_cat_id + 1
+        if count > 0:
+            raw_weight = total_anns / (num_fg_classes * count)
+            class_weights[model_cat_id] = torch.clamp(torch.tensor(math.sqrt(raw_weight)), max=10.0)
+    
+    class_weights[0] = 1.0 # Explicitly fix Background class to 1.0
+    print(f"[TRAIN] Smoothed Class Weights: {class_weights.cpu().numpy().round(3)}")
+
     val_dataset = EnergySegDataset(
         sequence_infos     = val_infos,
         frames_base        = FRAMES_BASE,
@@ -319,7 +363,6 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,  **loader_kwargs)
-    # shuffle the validation dataset so that the progress bar shows steady behavior
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=True, **loader_kwargs)
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -329,12 +372,35 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         img_w=IMG_W, img_h=IMG_H,
         energy_annot_w  = ENERGY_ANNOT_W,
         fullmap_annot_w = FULLMAP_ANNOT_W,        
+        class_weights   = class_weights,
     ).to(DEVICE)
+
+    # Confirm raw audio parameters dynamically to ensure cold-start integrity
+    actual_raw = model.det.backbone.body.conv1.audio_raw.item()
+    actual_scale = (torch.nn.functional.softplus(model.det.backbone.body.conv1.audio_raw) + 0.10).item()
+    print(f"\n[INFO] Cold start. audio_raw={actual_raw:.4f} | audio_scale={actual_scale:.4f}")
+
+    # Enforce the baseline modality prior is mathematically uncorrupted
+    assert abs(actual_raw - (-0.274)) < 0.01, (
+        f"[FATAL] audio_raw={actual_raw:.4f} deviates from expected -0.274. "
+        f"Check model.py initialization before running audiotuned5."
+    )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     body = model.det.backbone.body
     
-    backbone_stem_params = list(body.conv1.parameters()) + list(body.bn1.parameters())
+    # Group 1: RGB Stem (Standard LR)
+    stem_rgb_params   = list(body.conv1.conv1_rgb.parameters()) + [body.conv1.rgb_scale]
+    
+    # Group 2: Audio Stem (Elevated LR, No Weight Decay for Raw Scalar)
+    stem_audio_params = list(body.conv1.conv1_audio.parameters()) + [body.conv1.audio_raw]
+    
+    # Group 3: Normalization Layers
+    norm_params       = list(body.bn1.parameters()) + list(model.acoustic_norm.parameters())
+    
+    # Backbone Layers
+    layer1_params     = list(body.layer1.parameters())
+    backbone_l2_params = list(body.layer2.parameters())
     backbone_l3_params = list(body.layer3.parameters())
     backbone_l4_params = list(body.layer4.parameters())
     fpn_params         = list(model.det.backbone.fpn.parameters())
@@ -344,28 +410,39 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
     box_pred_params  = list(model.det.roi_heads.box_predictor.parameters())
     
     custom_params    = (
-        list(model.acoustic_norm.parameters()) + 
         list(model.energy_head.parameters()) +
         list(model.energy_decoder.parameters()) +
         list(model.distance_head.parameters())
     )
 
     optimizer = optim.AdamW([
-        {"params": backbone_stem_params,   "lr": LR*0.2,   "weight_decay": 1e-4, "name": "bb_stem"},
-        {"params": backbone_l3_params,     "lr": LR*0.05,  "weight_decay": 1e-4, "name": "bb_l3"},
-        {"params": backbone_l4_params,     "lr": LR*0.1,   "weight_decay": 1e-4, "name": "bb_l4"},
-        {"params": fpn_params,             "lr": LR*0.2,   "weight_decay": 1e-4, "name": "fpn"},
-        {"params": rpn_params,             "lr": LR*0.1,   "weight_decay": 1e-3, "name": "rpn"},
-        {"params": box_head_params,        "lr": LR*0.02,  "weight_decay": 5e-2, "name": "box_head"},
-        {"params": box_pred_params,        "lr": LR*0.02,  "weight_decay": 5e-2, "name": "box_pred"},
-        {"params": custom_params,          "lr": LR*0.5,   "weight_decay": 1e-2, "name": "custom"},
+        {"params": stem_rgb_params,    "lr": LR*0.2,  "weight_decay": 1e-4, "name": "stem_rgb"},
+        {"params": stem_audio_params,  "lr": LR*2.0,  "weight_decay": 0.0,  "name": "stem_audio"},
+        {"params": norm_params,        "lr": LR*1.0,  "weight_decay": 1e-4, "name": "norms"},
+        {"params": layer1_params,      "lr": LR*0.1,  "weight_decay": 1e-4, "name": "bb_l1"},
+        {"params": backbone_l2_params, "lr": LR*0.05, "weight_decay": 1e-4, "name": "bb_l2"},
+        {"params": backbone_l3_params, "lr": LR*0.05, "weight_decay": 1e-4, "name": "bb_l3"},
+        {"params": backbone_l4_params, "lr": LR*0.1,  "weight_decay": 1e-4, "name": "bb_l4"},
+        {"params": fpn_params,         "lr": LR*0.2,  "weight_decay": 1e-4, "name": "fpn"},
+        {"params": rpn_params,         "lr": LR*0.1,  "weight_decay": 5e-3, "name": "rpn"},
+        {"params": box_head_params,    "lr": LR*0.02, "weight_decay": 5e-2, "name": "box_head"},
+        {"params": box_pred_params,    "lr": LR*0.02, "weight_decay": 5e-2, "name": "box_pred"},
+        {"params": custom_params,      "lr": LR*0.5,  "weight_decay": 1e-2, "name": "custom"},
     ])
+
+    # Store initial LRs for hard phase resets
+    initial_lrs = {pg["name"]: pg["lr"] for pg in optimizer.param_groups}
+
+    # ── Verify Optimizer Parameter Groups ──
+    print("\n[TRAIN] Optimizer Parameter Groups:")
+    for pg in optimizer.param_groups:
+        print(f"  - {pg['name']:<12}: lr={pg['lr']:.1e} | wd={pg['weight_decay']:.1e} | params={sum(p.numel() for p in pg['params'])}")
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode     = "min",
         factor   = 0.5,
-        patience = 3,         
+        patience = SCHEDULER_PATIENCE,         
         min_lr   = 1e-8,
         verbose  = True,
     )
@@ -373,14 +450,19 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
     history           = defaultdict(list)
     t0                = time.time()
     best_loss         = float("inf")
+    phase_best_loss   = float("inf")
     epochs_no_improve = 0
-    prev_phase        = None
+    
+    # Establish Epoch 1 phase cleanly to avoid spurious reset logs
+    prev_phase, _, _  = apply_backbone_freeze(model, 1)
+
+    # ImageNet normalization mean to apply during RGB Dropout
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=DEVICE, dtype=torch.float32).view(3, 1, 1)
 
     def to_float(v):
         return v.item() if isinstance(v, torch.Tensor) else float(v or 0)
 
     def abbreviate_loss_name(name):
-        # More aggressive abbreviation to save space
         return (name.replace("loss_", "")
                     .replace("classifier", "cls")
                     .replace("objectness", "obj")
@@ -390,26 +472,50 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
                     .replace("energy_mask", "mask")
                     .replace("fullmap", "fmap")[:7])
 
-    print(f"[TRAIN] Max {NUM_EPOCHS} epochs × {len(train_dataset)} frames | "
+    print(f"\n[TRAIN] Max {NUM_EPOCHS} epochs × {len(train_dataset)} frames | "
           f"batch={batch_size} | workers={num_workers} | device={DEVICE}")
+
+    # Diagnostic & Tripwire Trackers
+    tripwire_consecutive  = 0
+    obj_divergence_epochs = 0
 
     for epoch in range(1, NUM_EPOCHS + 1):
                 
-        train_dataset.reset_epoch(balanced=False)
+        # Stratified sampling is fully handled inside reset_epoch
+        train_dataset.reset_epoch(balanced=True)
 
         if epoch % 10 == 1:
             acoustic_extractor.clear_cache()
 
         # ── Apply (or update) backbone freeze schedule ─────────────────────────
         phase, n_trainable, n_total = apply_backbone_freeze(model, epoch)
+        
+        # Hard resets occur at the TOP of the epoch before scheduler.step().
         if phase != prev_phase:
-            print(f"\n[FREEZE] Epoch {epoch}: training phase → '{phase}' "
-                  f"({n_trainable/1e6:.1f}M / {n_total/1e6:.1f}M params active)")
-
-            epochs_no_improve = max(0, epochs_no_improve - PHASE_GRACE)
-            scheduler.num_bad_epochs = max(0, scheduler.num_bad_epochs - PHASE_GRACE)
+            print(f"\n[FREEZE] Phase Transition: '{prev_phase}' → '{phase}'")
+            print(f"         ({n_trainable/1e6:.1f}M / {n_total/1e6:.1f}M params active)")
             
-            print(f"[FREEZE] Phase grace applied: patience counter → {epochs_no_improve}/{PATIENCE}")
+            # Save a boundary checkpoint (best model of the phase) before the new phase shock
+            phase_ckpt_path = os.path.join(exp_dir, f"phase_boundary_ep{epoch-1}.pth")
+            if os.path.exists(best_model_path):
+                shutil.copy2(best_model_path, phase_ckpt_path)
+                print(f"[FREEZE] Boundary checkpoint (best model) saved → {phase_ckpt_path}")
+            else:
+                torch.save(model.state_dict(), phase_ckpt_path)
+                print(f"[FREEZE] Boundary checkpoint (current state, no best yet) → {phase_ckpt_path}")
+
+            epochs_no_improve = 0
+            scheduler.num_bad_epochs = 0 
+            scheduler.best = float("inf")
+            phase_best_loss = float("inf")
+            tripwire_consecutive = 0
+            obj_divergence_epochs = 0
+            
+            # CRITICAL FIX: Restore optimizer learning rates to baseline.
+            for pg in optimizer.param_groups:
+                pg["lr"] = initial_lrs[pg["name"]]
+            
+            print(f"[FREEZE] Hard reset: Patience counters and scheduler best reset. LRs restored to initial baseline.")
 
             if epoch == UNFREEZE_LAYER4_EPOCH:
                 print(f"[FREEZE] layer4 active. (head LR = {_get_pg(optimizer, 'custom')['lr']:.2e})")
@@ -426,7 +532,6 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         ep_losses = defaultdict(float)
         n = 0
 
-        # Send tqdm explicitly to the original un-redirected stdout and use dynamic columns
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}/{NUM_EPOCHS} [Train]", 
                     leave=False, file=sys.__stdout__, dynamic_ncols=True)
         for images, targets in pbar:
@@ -436,6 +541,12 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
                  for k, v in t.items()}
                 for t in targets
             ]
+
+            # ── Modality Blindfolding (RGB Dropout) ──
+            for i in range(len(images)):
+                if random.random() < 0.15:                
+                    # Overwrite the first 3 channels (RGB) with ImageNet mean
+                    images[i][:3, :, :] = imagenet_mean
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -454,7 +565,6 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
                 ep_losses[k] += to_float(v)
             n += 1
 
-            # Calculate running average instead of showing instantaneous batch value
             postfix = {"Tot": f"{ep_losses['total']/n:.3f}"}
             for k in loss_dict.keys():
                 postfix[abbreviate_loss_name(k)] = f"{ep_losses[k]/n:.3f}"
@@ -468,7 +578,6 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         val_n         = 0
 
         if len(val_loader) > 0:
-            # Same tqdm settings for validation
             pbar_val = tqdm(val_loader, desc=f"Epoch {epoch:3d}/{NUM_EPOCHS} [Val]", 
                             leave=False, file=sys.__stdout__, dynamic_ncols=True)
             with torch.no_grad(), eval_behavior_for_loss(model):
@@ -489,7 +598,6 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
                         val_ep_losses[k] += to_float(v)
                     val_n += 1
 
-                    # Validation running average
                     postfix_val = {"Tot": f"{val_ep_losses['total']/val_n:.3f}"}
                     for k in loss_dict.keys():
                         postfix_val[abbreviate_loss_name(k)] = f"{val_ep_losses[k]/val_n:.3f}"
@@ -497,6 +605,43 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
 
             for k, v in val_ep_losses.items():
                 history[f"val_{k}"].append(v / max(val_n, 1))        
+
+            # ─── DIAGNOSTIC & FATAL TRIPWIRES ─────────────────────────────────────────
+
+            # 1. RPN Objectness Divergence Tripwire (Only active post full-unfreeze)
+            if epoch >= UNFREEZE_LAYER3_EPOCH:
+                train_obj_hist = history.get("loss_objectness", [0.0])
+                val_obj_hist   = history.get("val_loss_objectness", [0.0])
+                
+                train_obj = train_obj_hist[-1] if train_obj_hist else 0.0
+                val_obj   = val_obj_hist[-1] if val_obj_hist else 0.0
+                
+                obj_gap   = val_obj - train_obj
+                
+                if obj_gap > OBJ_GAP_TRIPWIRE:
+                    obj_divergence_epochs += 1
+                else:
+                    obj_divergence_epochs = 0
+                
+                print(f"  [OBJ Gap] val-train={obj_gap:.4f} | divergence_epochs={obj_divergence_epochs}/3")
+                
+                if obj_divergence_epochs >= 3:
+                    print(f"\n[!] FATAL: RPN Objectness Divergence! (val-train gap > {OBJ_GAP_TRIPWIRE} for 3 epochs).")
+                    print(f"    Unrecoverable hallucination floor hit. Terminating immediately.")
+                    break
+
+            # 2. General FPN Domain Shift Tripwire
+            if epoch >= UNFREEZE_LAYER3_EPOCH + 2:
+                em_val = history.get("val_loss_energy_mask", [0.0])
+                if em_val and em_val[-1] > ENERGY_MASK_TRIPWIRE:
+                    tripwire_consecutive += 1
+                else:
+                    tripwire_consecutive = 0
+
+                if tripwire_consecutive >= 2:
+                    print(f"\n[!] FATAL: val_loss_energy_mask exceeded {ENERGY_MASK_TRIPWIRE} for 2 consecutive epochs.")
+                    print(f"    Unrecoverable domain shift detected. Terminating immediately.")
+                    break
 
         # ─── EPOCH SUMMARY ────────────────────────────────────────────────────
         print(f"\n[{time.strftime('%H:%M:%S')}] Epoch {epoch}/{NUM_EPOCHS} Completed "
@@ -518,10 +663,16 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
                 if k != "total":
                     print(f"          - {k:<28}: {history[f'val_{k}'][-1]:.4f}")
 
-        # Explicit LR Logging
+        # Explicit LR, Scheduler, and Scalar Logging
         head_lr = _get_pg(optimizer, "custom")["lr"]
         fpn_lr  = _get_pg(optimizer, "fpn")["lr"]
-        print(f"  [LR] heads={head_lr:.2e} | FPN={fpn_lr:.2e}")
+        print(f"  [LR] heads={head_lr:.2e} | FPN={fpn_lr:.2e} | scheduler_bad_epochs={scheduler.num_bad_epochs}")
+        
+        rgb_s = model.det.backbone.body.conv1.rgb_scale.item()
+        audio_raw = model.det.backbone.body.conv1.audio_raw
+        effective_audio = (F.softplus(audio_raw) + 0.10).item()
+        
+        print(f"  [Stem Scalars] rgb_scale={rgb_s:.4f} | audio_scale={effective_audio:.4f} (raw={audio_raw.item():.4f})")
 
         # ─── EARLY STOPPING & SCHEDULING ──────────────────────────────────────
         track_raw = val_avg_total if val_n > 0 else train_tot
@@ -529,13 +680,16 @@ def train(train_infos: list, val_infos: list, exp_dir: str):
         scheduler.step(track_raw)
 
         if track_raw < best_loss:
-            best_loss         = track_raw
-            epochs_no_improve = 0
+            best_loss = track_raw
             torch.save(model.state_dict(), best_model_path)
-            print(f"  [*] Epoch loss improved to {best_loss:.4f}. Model saved → {best_model_path}")
+            print(f"  [*] New global best: {best_loss:.4f}. Model saved → {best_model_path}")
+
+        if track_raw < phase_best_loss:
+            phase_best_loss = track_raw
+            epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-            print(f"  [!] No improvement for {epochs_no_improve}/{PATIENCE} epochs. (Best: {best_loss:.4f}, Curr: {track_raw:.4f})")
+            print(f"  [!] No phase improvement for {epochs_no_improve}/{PATIENCE} epochs. (Phase Best: {phase_best_loss:.4f}, Curr: {track_raw:.4f})")
             if epochs_no_improve >= PATIENCE:
                 print(f"\n[!] Early stopping triggered after {epoch} epochs.")
                 break

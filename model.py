@@ -20,6 +20,51 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.ops import box_iou, MultiScaleRoIAlign
 from scipy.optimize import linear_sum_assignment
 
+# ── MODULE-LEVEL MONKEY PATCH (Must execute before model initialization) ──────
+import torchvision.models.detection.roi_heads as roi_heads_module
+
+# Global slot to hold class weights for the patched function
+_GLOBAL_CLASS_WEIGHTS = None
+
+def custom_fastrcnn_loss(class_logits, box_regression, labels, regression_targets):
+    # Torchvision passes labels and targets as lists (one per image).
+    # We must concatenate them into flat tensors first!
+    labels = torch.cat(labels, dim=0)
+    regression_targets = torch.cat(regression_targets, dim=0)
+
+    weights = None
+    if _GLOBAL_CLASS_WEIGHTS is not None:
+        # Ensure weights match the dtype and device of the incoming logits (AMP fp16 safety)
+        weights = _GLOBAL_CLASS_WEIGHTS.to(dtype=class_logits.dtype, device=class_logits.device)
+        
+    classification_loss = F.cross_entropy(class_logits, labels, weight=weights)
+
+    # Standard torchvision box regression calculation
+    labels_pos = labels > 0
+    if labels_pos.any():
+        sampled_pos_inds_subset = torch.where(labels_pos)[0]
+        labels_pos_subset = labels[sampled_pos_inds_subset]
+        
+        box_regression = box_regression.reshape(box_regression.size(0), -1, 4)
+        box_regression = box_regression[sampled_pos_inds_subset, labels_pos_subset]
+        regression_targets = regression_targets[sampled_pos_inds_subset]
+        
+        box_loss = F.smooth_l1_loss(
+            box_regression,
+            regression_targets,
+            beta=1 / 9,
+            reduction="sum",
+        )
+        box_loss = box_loss / labels.numel()
+    else:
+        box_loss = box_regression.sum() * 0
+
+    return classification_loss, box_loss
+
+# Overwrite the function directly inside the imported module namespace
+roi_heads_module.fastrcnn_loss = custom_fastrcnn_loss
+# ──────────────────────────────────────────────────────────────────────────────
+
 from acoustic_features import wav_path_from_seq_dir
 
 
@@ -333,8 +378,8 @@ class EnergySegDataset(Dataset):
             )
 
         return dict(
-            boxes        = torch.tensor(boxes,                           dtype=torch.float32),
-            labels       = torch.tensor(labels,                          dtype=torch.int64),
+            boxes        = torch.tensor(boxes,                             dtype=torch.float32),
+            labels       = torch.tensor(labels,                            dtype=torch.int64),
             masks        = torch.tensor(np.stack(bin_masks),             dtype=torch.bool),
             energy_maps  = torch.tensor(np.stack(energy_maps_list),      dtype=torch.float32),
             energy_masks = torch.tensor(np.stack(energy_masks_list),     dtype=torch.bool),
@@ -344,16 +389,11 @@ class EnergySegDataset(Dataset):
             instance_ids = torch.tensor(iids,                            dtype=torch.int64),
         )
 
-    # ADDED 'balanced' parameter to allow train.py to disable it dynamically
     def reset_epoch(self, balanced: bool = True):
         total = len(self.all_samples)
         n     = min(self.frames_per_epoch, total) if self.frames_per_epoch is not None else total
 
-        use_balanced = (
-            balanced
-            and self.augmentor is not None
-            and bool(self.class_to_sample_indices)
-        )
+        use_balanced = balanced and bool(self.class_to_sample_indices)
 
         if not use_balanced:
             indices = np.arange(total)
@@ -361,21 +401,46 @@ class EnergySegDataset(Dataset):
             self.current_indices = indices[:n]
             return
 
-        n_uniform  = min(n // 2, total)
-        n_balanced = n - n_uniform
+        classes = list(self.class_to_sample_indices.keys())
+        num_classes = len(classes)
+        
+        # Enforce over-representation for rare classes
+        min_quota_per_class = max(1, n // num_classes // 2)
 
-        uniform_part  = np.random.choice(total, n_uniform, replace=False)
+        balanced_part = []
+        for cls in classes:
+            pool = self.class_to_sample_indices[cls]
+            natural_quota = int((len(pool) / total) * n)
+            quota = max(natural_quota, min_quota_per_class)
+            
+            if len(pool) < quota:
+                choices = np.random.choice(pool, quota, replace=True)
+            else:
+                choices = np.random.choice(pool, quota, replace=False)
+            balanced_part.extend(choices)
 
-        classes       = list(self.class_to_sample_indices.keys())
-        balanced_part = np.empty(n_balanced, dtype=np.int64)
-        for i in range(n_balanced):
-            cls              = classes[int(np.random.randint(len(classes)))]
-            pool             = self.class_to_sample_indices[cls]
-            balanced_part[i] = pool[int(np.random.randint(len(pool)))]
+        balanced_part = np.array(balanced_part, dtype=np.int64)
+        
+        # Deduplicate strictly for calculating the remaining pool to avoid double-dipping,
+        # but WE KEEP the raw balanced_part for the final output to preserve over-sampling!
+        unique_balanced = np.unique(balanced_part)
 
-        self.current_indices = np.random.permutation(
-            np.concatenate([uniform_part, balanced_part])
-        )
+        if len(balanced_part) >= n:
+            np.random.shuffle(balanced_part)
+            self.current_indices = balanced_part[:n]
+        else:
+            remaining_pool = np.setdiff1d(np.arange(total), unique_balanced, assume_unique=True)
+            n_remaining = n - len(balanced_part)
+            
+            if n_remaining > 0:
+                uniform_part = np.random.choice(
+                    remaining_pool, n_remaining, 
+                    replace=(len(remaining_pool) < n_remaining)
+                )
+                # Concatenate the RAW balanced_part (with its intentional duplicates) + uniform_part
+                self.current_indices = np.random.permutation(np.concatenate([balanced_part, uniform_part]))
+            else:
+                self.current_indices = np.random.permutation(balanced_part)
 
     def __len__(self):
         return len(self.current_indices)
@@ -410,6 +475,57 @@ def worker_init_fn(worker_id):
 
 
 # ── 3. MODEL COMPONENTS ───────────────────────────────────────────────────────
+
+class DualModalityStem(nn.Module):
+    """
+    A custom stem that splits the 12-channel input into RGB (0:3) and Audio (3:12).
+    Includes a softplus floor for audio_raw to mathematically guarantee audio 
+    cannot be completely muted by the optimizer.
+    """
+    def __init__(self, old_conv1: nn.Conv2d, in_audio_ch: int = 9):
+        super().__init__()
+        
+        # 1. The RGB Pathway
+        self.conv1_rgb = nn.Conv2d(
+            3, old_conv1.out_channels, 
+            kernel_size=old_conv1.kernel_size, 
+            stride=old_conv1.stride, 
+            padding=old_conv1.padding, 
+            bias=(old_conv1.bias is not None)
+        )
+        with torch.no_grad():
+            self.conv1_rgb.weight.data.copy_(old_conv1.weight.data)
+            if old_conv1.bias is not None:
+                self.conv1_rgb.bias.data.copy_(old_conv1.bias.data)
+                
+        # 2. The Audio Pathway
+        self.conv1_audio = nn.Conv2d(
+            in_audio_ch, old_conv1.out_channels, 
+            kernel_size=old_conv1.kernel_size, 
+            stride=old_conv1.stride, 
+            padding=old_conv1.padding, 
+            bias=(old_conv1.bias is not None)
+        )
+        with torch.no_grad():
+            import torch.nn.init as init
+            init.kaiming_uniform_(self.conv1_audio.weight.data, a=math.sqrt(5))
+            if old_conv1.bias is not None:
+                init.zeros_(self.conv1_audio.bias.data)
+                
+        # Raw scalars for the modalities
+        self.rgb_scale = nn.Parameter(torch.tensor(1.0))
+        # Warm-started at equilibrium to skip 20 epochs of search
+        self.audio_raw = nn.Parameter(torch.tensor(-0.274))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rgb = x[:, :3, :, :]
+        audio = x[:, 3:, :, :]
+        
+        # Calculate dynamic floor to prevent optimizer from suffocating audio
+        audio_scale = F.softplus(self.audio_raw) + 0.10
+        
+        return self.rgb_scale * self.conv1_rgb(rgb) + audio_scale * self.conv1_audio(audio)
+
 
 class EnergyMaskHead(nn.Module):
     def __init__(self, in_ch: int = 256, mid: int = 256, dropout: float = 0.2):
@@ -507,8 +623,9 @@ class EnergyInstanceModel(nn.Module):
         img_w: int = 360,
         img_h: int = 180,
         energy_annot_w: float = 5.0,
-        fullmap_annot_w: float = 10.0, # CHANGED default to 10.0 to match strategy
+        fullmap_annot_w: float = 10.0, 
         dropout: float = 0.6,
+        class_weights: torch.Tensor = None,
     ):
         super().__init__()
         self.img_w           = img_w
@@ -516,21 +633,20 @@ class EnergyInstanceModel(nn.Module):
         self.energy_annot_w  = energy_annot_w
         self.fullmap_annot_w = fullmap_annot_w
 
+        # ── 1. Register Class Weights & Assign to Module-Level Tracker ──
+        if class_weights is None:
+            class_weights = torch.ones(num_classes)
+        self.register_buffer("class_weights", class_weights)
+        
+        # Inject weights into the global slot for our module-level monkey patch
+        global _GLOBAL_CLASS_WEIGHTS
+        _GLOBAL_CLASS_WEIGHTS = self.class_weights
+
         base = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
 
-        old = base.backbone.body.conv1
-        new = nn.Conv2d(
-            n_channels, old.out_channels,
-            old.kernel_size, old.stride, old.padding,
-            bias=(old.bias is not None),
-        )
-        with torch.no_grad():
-            new.weight.data[:, :3, :, :] = old.weight.data
-            import torch.nn.init as init
-            init.kaiming_uniform_(new.weight.data[:, 3:, :, :], a=math.sqrt(5))
-            if old.bias is not None:
-                new.bias.data.copy_(old.bias.data)
-        base.backbone.body.conv1 = new
+        # ── 2. Replace Backbone Stem with DualModalityStem ──
+        old_conv1 = base.backbone.body.conv1
+        base.backbone.body.conv1 = DualModalityStem(old_conv1, in_audio_ch=n_channels - 3)
 
         in_box = base.roi_heads.box_predictor.cls_score.in_features
         base.roi_heads.box_predictor = FastRCNNPredictor(in_box, num_classes)
@@ -652,10 +768,10 @@ class EnergyInstanceModel(nn.Module):
         x = images_t.tensors
         rgb_feats = x[:, :3, :, :]
         acoustic_feats = x[:, 3:, :, :]
-        
+
         acoustic_normed = self.acoustic_norm(acoustic_feats)
-        
         x_normed = torch.cat([rgb_feats, acoustic_normed], dim=1)
+        
         features = self.det.backbone(x_normed)
 
         fpn4        = self._fpn4(features)
@@ -665,7 +781,8 @@ class EnergyInstanceModel(nn.Module):
             device = images_t.tensors.device
 
             proposals, rpn_losses = self.det.rpn(images_t, features, targets_t)
-            _,         roi_losses = self.det.roi_heads(features, proposals, img_sizes, targets_t)
+            
+            _, roi_losses = self.det.roi_heads(features, proposals, img_sizes, targets_t)
 
             gt_boxes_t = [
                 self._jitter_boxes(tgt["boxes"].to(device), h, w)
@@ -716,8 +833,9 @@ class EnergyInstanceModel(nn.Module):
             }
 
         else:
-            proposals,        _ = self.det.rpn(images_t, features, None)
-            detections_raw,   _ = self.det.roi_heads(features, proposals, img_sizes, None)
+            proposals, _ = self.det.rpn(images_t, features, None)
+            
+            detections_raw, _ = self.det.roi_heads(features, proposals, img_sizes, None)
 
             all_boxes = [raw["boxes"] for raw in detections_raw]
             counts    = [len(b) for b in all_boxes]
