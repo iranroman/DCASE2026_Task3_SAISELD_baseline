@@ -19,7 +19,7 @@ CANVAS_W, CANVAS_H = 100, 50
 OUT_W, OUT_H       = 360, 180
 MAX_JSON_BYTES     = 20 * 1024 * 1024   # 20 MB
 
-DEFAULT_IOU_THRESHOLDS = np.round(np.arange(0.50, 1.00, 0.05), 2)
+DEFAULT_IOU_THRESHOLDS = np.round(np.arange(0.25, 1.00, 0.25), 2)
 
 CLASS_NAMES = [
     "Female speech",       # 0
