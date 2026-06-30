@@ -474,6 +474,8 @@ def compute_ap_at_thresholds(
 ) -> np.ndarray:
     det_records = [r for r in records if not r.get("fn", False)]
     if not det_records:
+        if n_gt > 0:
+            return np.zeros(len(iou_thresholds), dtype=float)
         return np.full(len(iou_thresholds), float("nan"))
     scores = np.array([r["score"] for r in det_records], dtype=np.float64)
     tp_mat = np.stack([r["tp"] for r in det_records])
